@@ -524,6 +524,51 @@ async function migrateFromBrowser() {
     save();
 }
 
+// ---------- last results cache: one small JSON file per book in the user's ST files folder ----------
+// (server-side so it survives reloads/devices; kept out of settings.json so settings stay small)
+function hashName(str) {
+    let h = 0x811c9dc5;
+    for (const ch of String(str)) { h ^= ch.codePointAt(0); h = Math.imul(h, 0x01000193) >>> 0; }
+    return h.toString(16).padStart(8, '0');
+}
+const cacheFile = (book) => `wikt-cache-${hashName(book)}.json`;
+function toBase64Utf8(text) {
+    const bytes = new TextEncoder().encode(text);
+    let bin = '';
+    for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+    return btoa(bin);
+}
+async function loadCache(book) {
+    try {
+        const res = await fetch(`/user/files/${cacheFile(book)}`, { cache: 'no-store' });
+        if (!res.ok) return {};
+        const data = await res.json();
+        return data && data.book === book ? data : {};
+    } catch { return {}; }
+}
+async function writeCache(book, cache) {
+    const c = ctx();
+    try {
+        if (!cache.translate && !cache.diag) {
+            await fetch('/api/files/delete', { method: 'POST', headers: c.getRequestHeaders(), body: JSON.stringify({ path: `user/files/${cacheFile(book)}` }) });
+            return;
+        }
+        await fetch('/api/files/upload', {
+            method: 'POST', headers: c.getRequestHeaders(),
+            body: JSON.stringify({ name: cacheFile(book), data: toBase64Utf8(JSON.stringify({ ...cache, book })) }),
+        });
+    } catch (e) { console.warn('[WIKT] cache save failed', e); }
+}
+const cacheTimers = new Map();
+function writeCacheSoon(book, getCache) {
+    clearTimeout(cacheTimers.get(book));
+    cacheTimers.set(book, setTimeout(() => { cacheTimers.delete(book); writeCache(book, getCache()); }, 1200));
+}
+
+// ---------- background job (one at a time, keeps running after the popup closes) ----------
+let currentJob = null; // { book, kind, text, cancel, done, popupOpen }
+const jobRunning = () => !!currentJob && !currentJob.done;
+
 function syncOriginal(data, uid, field, value) {
     const oKey = field === 'key' ? 'keys' : 'secondary_keys';
     const o = data.originalData?.entries?.find?.((x) => x.uid == uid);
@@ -622,8 +667,8 @@ async function openTranslator(presetBook) {
     const books = c.getWorldInfoNames();
     if (!books.length) { toastr.info('월드인포(로어북)가 하나도 없어요.'); return; }
 
-    const state = { book: books.includes(presetBook) ? presetBook : books[0], data: null, scope: 'all', picked: new Set(), rows: [], busy: false, cancel: false };
-    const isCancelled = () => state.cancel;
+    const state = { book: books.includes(presetBook) ? presetBook : books[0], data: null, scope: 'all', picked: new Set(), rows: [], busy: false, job: null, cache: {} };
+    const isCancelled = () => !!state.job?.cancel;
 
     // ===== translate tab controls =====
     const bookSel = el('select', { class: 'text_pole' }, books.map((b) => el('option', { value: b, text: b })));
@@ -676,6 +721,7 @@ async function openTranslator(presetBook) {
 
     const preview = el('div', { class: 'wikt-preview' });
     const applyBtn = el('div', { class: 'menu_button menu_button_icon wikt-apply', style: 'display:none' }, el('i', { class: 'fa-solid fa-check' }), el('span', { text: '체크한 항목 적용' }));
+    const clearTransBtn = el('div', { class: 'menu_button menu_button_icon', style: 'display:none', title: '저장된 번역 결과(미리보기)를 지워요. 로어북은 안 바뀌어요.' }, el('i', { class: 'fa-solid fa-eraser' }), el('span', { text: '결과 지우기' }));
 
     function updateVisibility() {
         const otherIsAI = provSel.value !== 'ai';
@@ -709,7 +755,7 @@ async function openTranslator(presetBook) {
         el('div', { class: 'wikt-row' }, runBtn, stopBtn, undoBtn),
         status,
         preview,
-        applyBtn,
+        el('div', { class: 'wikt-row' }, applyBtn, clearTransBtn),
     );
 
     // ===== settings tab =====
@@ -804,6 +850,7 @@ async function openTranslator(presetBook) {
     const diagStopBtn = el('div', { class: 'menu_button', text: '중지', style: 'display:none' });
     const diagApplyBtn = el('div', { class: 'menu_button menu_button_icon', style: 'display:none' }, el('i', { class: 'fa-solid fa-check' }), el('span', { text: '체크한 항목 적용' }));
     const diagUndoBtn = el('div', { class: 'menu_button menu_button_icon' }, el('i', { class: 'fa-solid fa-rotate-left' }), el('span', { text: '마지막 작업 되돌리기' }));
+    const clearDiagBtn = el('div', { class: 'menu_button menu_button_icon', style: 'display:none', title: '저장된 진단 결과를 지워요. 로어북은 안 바뀌어요.' }, el('i', { class: 'fa-solid fa-eraser' }), el('span', { text: '결과 지우기' }));
 
     // language cleanup (before re-translating)
     const cleanLangBoxes = LANGS.map((l) => {
@@ -835,7 +882,7 @@ async function openTranslator(presetBook) {
         el('div', { class: 'wikt-row' }, quickBtn, aiDiagBtn, diagStopBtn, diagUndoBtn),
         diagStatus,
         diagList,
-        diagApplyBtn,
+        el('div', { class: 'wikt-row' }, diagApplyBtn, clearDiagBtn),
         el('details', { class: 'wikt-clean' },
             el('summary', { text: '언어별 키워드 지우기 (다시 번역하기 전에)' }),
             el('div', { class: 'wikt-row' }, el('b', { text: '지울 언어' }),
@@ -881,9 +928,113 @@ async function openTranslator(presetBook) {
         state.rows = [];
         preview.replaceChildren();
         applyBtn.style.display = 'none';
+        clearTransBtn.style.display = 'none';
+        status.textContent = '';
         renderPickList();
         clearDiag();
         refreshDiagBadge();
+        await restoreFromCache();
+        if (jobRunning() && currentJob.book === state.book) attachToJob(currentJob);
+    }
+
+    // --- last results cache (per book, server file) ---
+    const plainRows = () => state.rows.map((r) => ({ uid: r.uid, title: r.title, adds: r.adds, checked: r.checked !== false, value: r.value || null }));
+    const plainDiag = (d) => ({ rows: (d?.rows || []).map((r) => ({ ...r, items: r.items.map(({ cb, ...it }) => it) })) });
+    const stamp = (t) => new Date(t).toLocaleString();
+    function persistTranslate() {
+        if (!state.cache.translate) return;
+        state.cache.translate.rows = plainRows();
+        const book = state.book, cache = state.cache;
+        writeCacheSoon(book, () => cache);
+    }
+    function persistDiag() {
+        if (!state.cache.diag) return;
+        state.cache.diag.rows = plainDiag(state.diag).rows;
+        const book = state.book, cache = state.cache;
+        writeCacheSoon(book, () => cache);
+    }
+
+    /** Drops cached suggestions the book no longer needs (already added, removed, entry gone). */
+    function reconcileTranslate(rows) {
+        const out = [];
+        for (const r of rows || []) {
+            const e = state.data?.entries?.[r.uid];
+            if (!e) continue;
+            const adds = {};
+            const value = {};
+            for (const [f, list] of Object.entries(r.adds || {})) {
+                const have = new Set((e[f] || []).map(norm));
+                const keep = list.filter((a) => !have.has(norm(a.t)));
+                const v = r.value?.[f] != null ? splitInput(r.value[f]).filter((w) => !have.has(norm(w))).join(', ') : null;
+                if (keep.length || v) { adds[f] = keep.length ? keep : list.filter((a) => splitInput(v).includes(a.t)); if (v != null) value[f] = v; }
+            }
+            if (Object.keys(adds).length) out.push({ ...r, adds, value: Object.keys(value).length ? value : null });
+        }
+        return out;
+    }
+    function reconcileDiag(rows) {
+        const out = [];
+        for (const r of rows || []) {
+            const e = state.data?.entries?.[r.uid];
+            if (!e) continue;
+            const items = r.items.filter((it) => {
+                const has = (e[it.f] || []).some((k) => norm(k) === norm(it.k));
+                return it.op === 'add' ? !has : has;
+            });
+            if (items.length) out.push({ ...r, items });
+        }
+        return out;
+    }
+
+    async function restoreFromCache() {
+        const book = state.book;
+        const cache = await loadCache(book);
+        if (state.book !== book) return; // book switched meanwhile
+        state.cache = cache;
+        if (cache.translate) {
+            state.rows = reconcileTranslate(cache.translate.rows);
+            if (state.rows.length) {
+                renderPreview();
+                status.textContent = `📌 마지막 결과를 불러왔어요 (${stamp(cache.translate.time)}) — 엔트리 ${state.rows.length}개. ${cache.translate.status || ''}`;
+            } else delete cache.translate;
+        }
+        if (cache.diag) {
+            const rows = reconcileDiag(cache.diag.rows);
+            if (rows.length) renderDiag({ rows }, `📌 마지막 진단 결과를 불러왔어요 (${stamp(cache.diag.time)}). ${cache.diag.summary || ''}`);
+            else delete cache.diag;
+        }
+        if (!cache.translate && !cache.diag && (cache.book)) writeCache(book, cache); // nothing left → remove the file
+    }
+
+    // --- background jobs ---
+    function beginJob(kind) {
+        currentJob = { book: state.book, kind, text: '', cancel: false, done: false, popupOpen: true };
+        state.job = currentJob;
+        setBusy(true);
+        return currentJob;
+    }
+    function endJob(job, doneText) {
+        job.done = true;
+        job.text = doneText;
+        if (!job.popupOpen) toastr.success(`${doneText} — 번역기를 다시 열면 결과가 있어요.`, `${job.book} · 백그라운드 작업 완료`, { timeOut: 10000 });
+        if (state.job === job) setBusy(false);
+    }
+    /** Re-opened while a job is running: show its progress and load the results once it finishes. */
+    function attachToJob(job) {
+        state.job = job;
+        job.popupOpen = true;
+        setBusy(true);
+        const target = job.kind === 'translate' ? status : diagStatus;
+        if (job.kind !== 'translate') showTab('d');
+        const tick = async () => {
+            if (state.closed) { clearInterval(timer); return; }
+            if (!job.done) { target.textContent = `⏳ 백그라운드에서 진행 중 — ${job.text || '준비 중'}`; return; }
+            clearInterval(timer);
+            setBusy(false);
+            await restoreFromCache();
+        };
+        const timer = setInterval(tick, 500);
+        tick();
     }
     function entriesOf(data) {
         return Object.values(data?.entries || {}).sort((a, b) => (a.displayIndex ?? a.uid) - (b.displayIndex ?? b.uid));
@@ -921,18 +1072,32 @@ async function openTranslator(presetBook) {
     // --- shared helpers ---
     function setBusy(b) {
         state.busy = b;
-        for (const x of [runBtn, applyBtn, quickBtn, aiDiagBtn, diagApplyBtn, cleanBtn]) x.classList.toggle('disabled', b);
-        stopBtn.style.display = b ? '' : 'none';
-        diagStopBtn.style.display = b ? '' : 'none';
+        for (const x of [runBtn, applyBtn, quickBtn, aiDiagBtn, diagApplyBtn, cleanBtn, undoBtn, diagUndoBtn, clearTransBtn, clearDiagBtn]) x.classList.toggle('disabled', b);
+        bookSel.disabled = b;
+        const isJob = b && state.job && !state.job.done;
+        stopBtn.style.display = isJob ? '' : 'none';
+        diagStopBtn.style.display = isJob ? '' : 'none';
     }
-    const onStop = () => { state.cancel = true; status.textContent = diagStatus.textContent = '중지하는 중… (지금 보내는 요청이 끝나면 멈춰요)'; };
+    /** Blocks a new action while something runs; explains when another book's job is running. */
+    function blocked() {
+        if (jobRunning() && currentJob.book !== state.book) {
+            toastr.warning(`다른 로어북("${currentJob.book}")에서 작업이 진행 중이에요. 끝난 뒤에 해 주세요.`);
+            return true;
+        }
+        return state.busy || jobRunning();
+    }
+    const onStop = () => {
+        if (state.job) state.job.cancel = true;
+        status.textContent = diagStatus.textContent = '중지하는 중… (지금 보내는 요청이 끝나면 멈춰요)';
+    };
     stopBtn.addEventListener('click', onStop);
     diagStopBtn.addEventListener('click', onStop);
 
     function phase(label, total, target = status) {
         let done = 0;
-        target.textContent = `${label}… 0 / ${total}`;
-        return (n) => { done += n; target.textContent = `${label}… ${Math.min(done, total)} / ${total}`; };
+        const set = (t) => { target.textContent = t; if (state.job) state.job.text = t; };
+        set(`${label}… 0 / ${total}`);
+        return (n) => { done += n; set(`${label}… ${Math.min(done, total)} / ${total}`); };
     }
     const reportError = (e, title) => {
         console.error('[WIKT]', e);
@@ -953,7 +1118,7 @@ async function openTranslator(presetBook) {
 
     // ===== translate =====
     runBtn.addEventListener('click', async () => {
-        if (state.busy) return;
+        if (blocked()) return;
         const langs = langBoxes.filter((x) => x.checked).map((x) => x.value);
         if (!langs.length) { toastr.warning('추가할 언어를 하나 이상 골라주세요.'); return; }
         if (!state.data) await loadBook();
@@ -993,8 +1158,8 @@ async function openTranslator(presetBook) {
             if (!ok) return;
         }
 
-        setBusy(true);
-        state.cancel = false;
+        const job = beginJob('translate');
+        const book = state.book, cache = state.cache;
         const results = new Map();
         let other = null;
         const back = new Map();
@@ -1002,7 +1167,7 @@ async function openTranslator(presetBook) {
             if (aiMain) await aiTranslateNeed(need, phase('AI 번역 중', total), isCancelled, results);
             else await freeTranslateNeed(provider, need, phase('번역 중', total), isCancelled, results);
 
-            if (s.verifyCompare && !state.cancel) {
+            if (s.verifyCompare && !isCancelled()) {
                 await gap(aiMain ? 'free' : 'ai');
                 other = new Map();
                 if (aiMain) await freeTranslateNeed('google', need, phase('비교용 Google 번역 중', total), isCancelled, other);
@@ -1037,7 +1202,7 @@ async function openTranslator(presetBook) {
         }
 
         // back-translation of every proposed keyword into its source keyword's language
-        if (s.verifyBack && !state.cancel && state.rows.length) {
+        if (s.verifyBack && !isCancelled() && state.rows.length) {
             const byLang = new Map();
             for (const r of state.rows) for (const adds of Object.values(r.adds)) for (const a of adds) {
                 const bl = detectLang(a.src);
@@ -1048,7 +1213,7 @@ async function openTranslator(presetBook) {
             const prog = phase(aiBack ? 'AI 역번역 중' : '역번역 중', n);
             try {
                 for (const [bl, set] of byLang) {
-                    if (state.cancel) break;
+                    if (isCancelled()) break;
                     await gap(aiBack ? 'ai' : 'free');
                     const part = new Map();
                     try {
@@ -1063,14 +1228,18 @@ async function openTranslator(presetBook) {
                 a.back = back.get(`${detectLang(a.src)}\0${a.t}`) ?? null;
             }
         }
-        setBusy(false);
-
         const hay = norm(chatMessages().join('\n'));
         for (const r of state.rows) for (const a of Object.values(r.adds).flat()) a.hits = hay ? countHits(hay, a.t) : null;
-        renderPreview();
         const warn = state.rows.reduce((x, r) => x + Object.values(r.adds).flat().filter(isSuspicious).length, 0);
-        status.textContent = `${state.cancel ? '중지됨 — 지금까지 된 것: ' : '완료 — '}새 키워드가 생긴 엔트리 ${state.rows.length}개` +
+        const summary = `${job.cancel ? '중지됨 — 지금까지 된 것: ' : '완료 — '}새 키워드가 생긴 엔트리 ${state.rows.length}개` +
             `${warn ? `, 확인이 필요한 키워드 ⚠️ ${warn}개` : ''}.${state.rows.length ? " 확인 후 '적용'을 눌러주세요." : ''}`;
+        // save first, so a re-opened window (or another device) can load it as soon as the job is done
+        if (state.rows.length) cache.translate = { time: Date.now(), rows: plainRows(), status: summary };
+        else delete cache.translate;
+        await writeCache(book, cache);
+        renderPreview();
+        status.textContent = summary;
+        endJob(job, summary.split('.')[0]);
     });
 
     const backOk = (a) => a.back != null && normLoose(a.back) === normLoose(a.src);
@@ -1088,7 +1257,7 @@ async function openTranslator(presetBook) {
         inp.value = [...new Set(parts)].join(', ');
     }
 
-    function renderChecks(adds, inp) {
+    function renderChecks(adds, inp, onChange) {
         const anyCheck = adds.some((a) => a.back != null || a.alt != null || a.hits != null);
         if (!anyCheck) return null;
         const box = el('div', { class: 'wikt-checks' });
@@ -1101,6 +1270,7 @@ async function openTranslator(presetBook) {
             if (a.t === a.orig) delete a.orig;
             chip.replaceWith(makeChip(a));
             refreshWarn();
+            onChange();
         };
         const makeChip = (a) => {
             const bad = isSuspicious(a);
@@ -1132,33 +1302,50 @@ async function openTranslator(presetBook) {
 
     function renderPreview() {
         preview.replaceChildren();
-        if (!state.rows.length) { applyBtn.style.display = 'none'; return; }
-        const master = el('input', { type: 'checkbox', checked: true });
-        master.addEventListener('change', () => preview.querySelectorAll('.wikt-item > label > input[type=checkbox]').forEach((x) => { x.checked = master.checked; }));
+        const has = state.rows.length > 0;
+        applyBtn.style.display = has ? '' : 'none';
+        clearTransBtn.style.display = has ? '' : 'none';
+        if (!has) return;
+        const master = el('input', { type: 'checkbox', checked: state.rows.every((r) => r.checked !== false) });
+        master.addEventListener('change', () => {
+            for (const r of state.rows) { r.checked = master.checked; r.cb.checked = master.checked; }
+            persistTranslate();
+        });
         preview.append(el('label', { class: 'wikt-master' }, master, ' 전체 체크'));
         for (const r of state.rows) {
             const e = state.data.entries[r.uid];
-            const cb = el('input', { type: 'checkbox', checked: true });
+            const cb = el('input', { type: 'checkbox', checked: r.checked !== false });
+            cb.addEventListener('change', () => { r.checked = cb.checked; persistTranslate(); });
             r.cb = cb;
             r.inputs = {};
             const item = el('div', { class: 'wikt-item' },
                 el('label', {}, cb, ' ', el('b', { text: r.title })),
                 el('small', { class: 'wikt-keys', text: `기존: ${(e?.key || []).join(', ')}` }));
             for (const [f, adds] of Object.entries(r.adds)) {
-                const inp = el('input', { class: 'text_pole', type: 'text', value: adds.map((a) => a.t).join(', ') });
+                const inp = el('input', { class: 'text_pole', type: 'text', value: r.value?.[f] ?? adds.map((a) => a.t).join(', ') });
+                const remember = () => { (r.value ??= {})[f] = inp.value; persistTranslate(); };
+                inp.addEventListener('input', remember);
                 r.inputs[f] = inp;
                 item.append(el('div', { class: 'wikt-addrow' }, el('small', { text: f === 'key' ? '+ 추가 키워드' : '+ 보조 키워드' }), inp));
-                const checks = renderChecks(adds, inp);
+                const checks = renderChecks(adds, inp, remember);
                 if (checks) item.append(checks);
             }
             if (Object.values(r.adds).flat().some(isSuspicious)) item.classList.add('has-warn');
             preview.append(item);
         }
-        applyBtn.style.display = '';
     }
 
+    clearTransBtn.addEventListener('click', () => {
+        if (blocked()) return;
+        state.rows = [];
+        delete state.cache.translate;
+        writeCache(state.book, state.cache);
+        renderPreview();
+        status.textContent = '저장된 번역 결과를 지웠어요.';
+    });
+
     applyBtn.addEventListener('click', async () => {
-        if (state.busy || !state.rows.length) return;
+        if (blocked() || !state.rows.length) return;
         const ops = [];
         for (const r of state.rows) {
             if (!r.cb.checked) continue;
@@ -1175,6 +1362,8 @@ async function openTranslator(presetBook) {
             if (!res.added) { toastr.info('새로 추가할 키워드가 없어요. (이미 다 있어요)'); return; }
             toastr.success(`엔트리 ${res.entries}개에 키워드 ${res.added}개를 추가했어요.`, state.book);
             state.rows = [];
+            delete state.cache.translate;
+            writeCache(state.book, state.cache);
             renderPreview();
             renderPickList();
             status.textContent = '적용 완료! 잘못됐으면 "마지막 작업 되돌리기"를 눌러주세요. (창을 닫거나 새로고침해도 돼요)';
@@ -1187,7 +1376,7 @@ async function openTranslator(presetBook) {
     });
 
     async function onUndo() {
-        if (state.busy) return;
+        if (blocked()) return;
         const r = await undoLast();
         if (r && r.book === state.book) { state.data = r.data; renderPickList(); clearDiag(); refreshDiagBadge(); }
     }
@@ -1199,8 +1388,22 @@ async function openTranslator(presetBook) {
         state.diag = null;
         diagList.replaceChildren();
         diagApplyBtn.style.display = 'none';
+        clearDiagBtn.style.display = 'none';
         diagStatus.textContent = '';
     }
+    /** Saves a diagnose/cleanup result as this book's last diag result (or removes it when empty). */
+    async function saveDiagResult(book, cache, d, summary) {
+        if (d?.rows?.length) cache.diag = { time: Date.now(), rows: plainDiag(d).rows, summary };
+        else delete cache.diag;
+        await writeCache(book, cache);
+    }
+    clearDiagBtn.addEventListener('click', () => {
+        if (blocked()) return;
+        delete state.cache.diag;
+        writeCache(state.book, state.cache);
+        clearDiag();
+        diagStatus.textContent = '저장된 진단 결과를 지웠어요.';
+    });
 
     /** Free check: zero-hit keywords whose entry matched through another keyword in the same script. */
     function quickDiagnose() {
@@ -1251,16 +1454,22 @@ async function openTranslator(presetBook) {
     function renderDiag(d, summary) {
         diagList.replaceChildren();
         diagApplyBtn.style.display = 'none';
+        clearDiagBtn.style.display = 'none';
         state.diag = d;
         diagStatus.textContent = summary;
-        if (!d?.rows.length) return;
+        if (!d?.rows?.length) return;
         const master = el('input', { type: 'checkbox' });
-        master.addEventListener('change', () => { for (const r of d.rows) for (const it of r.items) { it.cb.checked = master.checked; } });
+        master.addEventListener('change', () => {
+            for (const r of d.rows) for (const it of r.items) { it.cb.checked = master.checked; it.picked = master.checked; }
+            persistDiag();
+        });
         diagList.append(el('label', { class: 'wikt-master' }, master, ' 전체 체크/해제'));
         for (const r of d.rows) {
             const item = el('div', { class: 'wikt-item' }, el('b', { text: r.title }), r.info ? el('small', { class: 'wikt-src', text: r.info }) : null);
             for (const it of r.items) {
-                const cb = el('input', { type: 'checkbox', checked: it.checked });
+                // it.checked = recommendation (drives the color); it.picked = the user's current tick
+                const cb = el('input', { type: 'checkbox', checked: it.picked ?? it.checked });
+                cb.addEventListener('change', () => { it.picked = cb.checked; persistDiag(); });
                 it.cb = cb;
                 item.append(el('label', { class: 'wikt-diagrow' }, cb, ' ',
                     el('span', { class: it.op === 'add' ? 'wikt-op-add' : 'wikt-op-del', text: it.op === 'add' ? '+ 추가' : '− 삭제' }), ' ',
@@ -1272,25 +1481,28 @@ async function openTranslator(presetBook) {
             diagList.append(item);
         }
         diagApplyBtn.style.display = '';
+        clearDiagBtn.style.display = '';
     }
 
     const rangeLabel = (msgs) => `${msgs.length}개 메시지 (#${msgs[0].id} ~ #${msgs[msgs.length - 1].id}${s.diagHidden ? ', 숨김 포함' : ''})`;
 
     quickBtn.addEventListener('click', async () => {
-        if (state.busy) return;
+        if (blocked()) return;
         if (!state.data) await loadBook();
         const d = quickDiagnose();
         if (!d) { renderDiag(null, '선택한 범위에 메시지가 없어요. 채팅을 열었는지, 범위 설정을 확인해 주세요.'); return; }
         const msgs = rangeMessages();
         const total = d.rows.reduce((a, r) => a + r.items.length, 0);
-        renderDiag(d, d.rows.length
-            ? `${rangeLabel(msgs)}에서 안 걸린 키워드 ${total}개 (삭제 추천 ${d.recommended}개)`
-            : `${rangeLabel(msgs)}에서 정리할 키워드가 없어요.` + (s.diagScope === 'added' ? ' (대상: 이 확장이 추가한 키워드만 — 직접 넣은 키워드도 보려면 "모든 키워드")' : ''));
+        const summary = d.rows.length
+            ? `빠른 진단: ${rangeLabel(msgs)}에서 안 걸린 키워드 ${total}개 (삭제 추천 ${d.recommended}개)`
+            : `${rangeLabel(msgs)}에서 정리할 키워드가 없어요.` + (s.diagScope === 'added' ? ' (대상: 이 확장이 추가한 키워드만 — 직접 넣은 키워드도 보려면 "모든 키워드")' : '');
+        renderDiag(d, summary);
+        await saveDiagResult(state.book, state.cache, d, summary);
         tabBtnD.textContent = d.recommended ? `진단 (${d.recommended})` : '진단';
     });
 
     aiDiagBtn.addEventListener('click', async () => {
-        if (state.busy) return;
+        if (blocked()) return;
         if (!state.data) await loadBook();
         const msgs = rangeMessages();
         if (!msgs.length) { diagStatus.textContent = '선택한 범위에 메시지가 없어요. 채팅을 열었는지, 범위 설정을 확인해 주세요.'; return; }
@@ -1308,8 +1520,8 @@ async function openTranslator(presetBook) {
             `${profileName()}로 채팅 ${rangeLabel(msgs)} + 엔트리 ${targets.length}개의 제목·키워드를 보내요.\n요청 ${nReq}번 · 약 ${chars.toLocaleString()}자 (대략 그만큼의 입력 토큰). 진행할까요?`);
         if (!ok) return;
 
-        setBusy(true);
-        state.cancel = false;
+        const job = beginJob('diag');
+        const book = state.book, cache = state.cache;
         const fullText = msgs.map((m) => m.text).join('\n');
         const hay = norm(fullText);
         const forms = new Map(); // uid → Map(form → hits)
@@ -1321,7 +1533,7 @@ async function openTranslator(presetBook) {
             for (const t of textChunks) {
                 const chunkHay = norm(t);
                 for (const ec of entryChunks) {
-                    if (state.cancel) break outer;
+                    if (isCancelled()) break outer;
                     if (done++ > 0) await sleep(delay);
                     const json = await callAIJson(buildDiagPrompt(ec, t), Math.min(8000, 300 + ec.length * 60), AI_SYSTEM_DIAG);
                     ec.forEach((e, j) => {
@@ -1374,13 +1586,15 @@ async function openTranslator(presetBook) {
             }
             if (items.length) rows.push({ uid: String(e.uid), title: entryTitle(e), info: `채팅 속 표기: ${formList.map(([x, h]) => `${x}(${h})`).join(', ')}`, items });
         }
-        setBusy(false);
-        renderDiag({ rows }, `${state.cancel ? '중지됨 — 지금까지: ' : '완료 — '}언급된 엔트리 ${forms.size}개, 추가 후보 ${nAdd}개, 삭제 후보 ${nDel}개` +
-            (dropped ? ` (채팅에 실제로 없는 AI 답변 ${dropped}개는 버렸어요)` : '') + (rows.length ? ". 확인 후 '적용'을 눌러주세요." : '.'));
+        const summary = `AI 정밀 진단 ${job.cancel ? '중지됨 — 지금까지: ' : '완료 — '}언급된 엔트리 ${forms.size}개, 추가 후보 ${nAdd}개, 삭제 후보 ${nDel}개` +
+            (dropped ? ` (채팅에 실제로 없는 AI 답변 ${dropped}개는 버렸어요)` : '') + (rows.length ? ". 확인 후 '적용'을 눌러주세요." : '.');
+        await saveDiagResult(book, cache, { rows }, summary);
+        renderDiag({ rows }, summary);
+        endJob(job, `AI 정밀 진단 ${job.cancel ? '중지됨' : '완료'} — 추가 후보 ${nAdd}개, 삭제 후보 ${nDel}개`);
     });
 
     cleanBtn.addEventListener('click', async () => {
-        if (state.busy) return;
+        if (blocked()) return;
         if (!state.data) await loadBook();
         const langs = s.cleanLangs;
         if (!langs.length) { toastr.warning('지울 언어를 하나 이상 골라주세요.'); return; }
@@ -1408,13 +1622,15 @@ async function openTranslator(presetBook) {
             }
             if (items.length) rows.push({ uid: String(e.uid), title: entryTitle(e), info: `현재 키워드: ${(e.key || []).join(', ')}`, items });
         }
-        renderDiag({ rows }, rows.length
-            ? `지울 키워드 ${total}개 — 확인 후 '적용'을 누르면 삭제돼요. (되돌리기 가능)`
-            : (s.cleanScope === 'added' ? '이 확장이 추가한 기록 중 해당 언어 키워드가 없어요. (1.0.4 이전에 넣은 키워드는 "모든 키워드"로 찾아요)' : '해당 언어로 보이는 키워드가 없어요.'));
+        const summary = rows.length
+            ? `언어별 지우기: 지울 키워드 ${total}개 — 확인 후 '적용'을 누르면 삭제돼요. (되돌리기 가능)`
+            : (s.cleanScope === 'added' ? '이 확장이 추가한 기록 중 해당 언어 키워드가 없어요. (1.0.4 이전에 넣은 키워드는 "모든 키워드"로 찾아요)' : '해당 언어로 보이는 키워드가 없어요.');
+        renderDiag({ rows }, summary);
+        await saveDiagResult(state.book, state.cache, { rows }, summary);
     });
 
     diagApplyBtn.addEventListener('click', async () => {
-        if (state.busy || !state.diag?.rows?.length) return;
+        if (blocked() || !state.diag?.rows?.length) return;
         const ops = [];
         for (const r of state.diag.rows) for (const it of r.items) if (it.cb?.checked) ops.push({ uid: r.uid, f: it.f, op: it.op, k: it.k, lang: it.lang });
         if (!ops.length) { toastr.info('체크한 항목이 없어요.'); return; }
@@ -1429,6 +1645,8 @@ async function openTranslator(presetBook) {
             if (res.added || res.removed) toastr.success(`추가 ${res.added}개, 삭제 ${res.removed}개 적용했어요.`, state.book);
             renderPickList();
             clearDiag();
+            delete state.cache.diag;
+            writeCache(state.book, state.cache);
             diagStatus.textContent = '적용 완료! 잘못됐으면 "마지막 작업 되돌리기"를 눌러주세요. (창을 닫거나 새로고침해도 돼요)';
             refreshDiagBadge();
         } catch (e) {
@@ -1442,7 +1660,22 @@ async function openTranslator(presetBook) {
     updateVisibility();
     await c.callGenericPopup(root, c.POPUP_TYPE.TEXT, '', {
         wide: true, large: true, allowVerticalScrolling: true, leftAlign: true, okButton: '닫기',
-        onClosing: () => { state.cancel = true; return true; },
+        // Closing while a job runs: ask whether to keep it going in the background or stop it.
+        onClosing: async () => {
+            const job = state.job;
+            if (!job || job.done) return true;
+            const what = job.kind === 'translate' ? '번역' : 'AI 진단';
+            const answer = await c.callGenericPopup(
+                `${what}이 아직 진행 중이에요. (${job.text || '준비 중'})<br><br>백그라운드에서 계속하면 창을 닫아도 진행되고, 끝나면 알림이 떠요. 다시 열면 결과가 그대로 있어요.`,
+                c.POPUP_TYPE.TEXT, '', { okButton: '백그라운드에서 계속', cancelButton: '취소', customButtons: ['중지하고 닫기'] });
+            if (answer === c.POPUP_RESULT.AFFIRMATIVE) { job.popupOpen = false; return true; }
+            if (answer === 2) { job.cancel = true; job.popupOpen = false; return true; }
+            return false;
+        },
+        onClose: () => {
+            state.closed = true;
+            if (state.job && !state.job.done) state.job.popupOpen = false;
+        },
     });
 }
 
