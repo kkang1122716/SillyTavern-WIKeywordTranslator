@@ -40,4 +40,9 @@
 .wikt-setlabel { flex: 0 1 260px; }
 .wikt-root select.wikt-inline-select { flex: 0 1 220px; }
 .wikt-diagrow { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; cursor: pointer; padding-left: 4px; word-break: break-all; }
+.wikt-op-add { color: #4caf7a; font-weight: bold; white-space: nowrap; }
+.wikt-op-del { color: #d9a43a; font-weight: bold; white-space: nowrap; }
+.wikt-clean { border: 1px solid var(--SmartThemeBorderColor); border-radius: 8px; padding: 6px 8px; margin-top: 8px; }
+.wikt-clean summary { cursor: pointer; font-weight: bold; }
+.wikt-clean > .wikt-row, .wikt-clean > small { margin-top: 6px; }
 .wikt-root .menu_button.disabled { opacity: 0.5; pointer-events: none; }
