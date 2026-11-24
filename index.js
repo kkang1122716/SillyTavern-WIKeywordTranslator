@@ -71,6 +71,8 @@ const defaultSettings = Object.freeze({
     aiRules: '',        // '' = DEFAULT_RULES
     aiContext: 'keywords', // what AI translation sees: 'keywords' | 'snippet' | 'full'
     contentChars: 300,  // snippet length for aiContext 'snippet'
+    aiLinked: true,     // share book overview, related entries and decided translations between requests
+    overviewChars: 4000, // max size of the book overview sent with each AI request
     verifyBack: false,
     backProvider: 'free', // 'free' (Google/Bing) | 'ai'
     verifyCompare: false,
@@ -360,8 +362,93 @@ function entryContext(e) {
     return text.length > cap ? `${text.slice(0, cap)} …(이하 생략)` : text;
 }
 
+// ---------- links between entries ----------
+/**
+ * Entry relations for "연결 고려": entry A links to B when one of B's keywords appears in A's title/content.
+ * Also builds a compact overview of the whole book and keeps translations decided so far,
+ * so later requests stay consistent with earlier ones (화산파 → 华山派 before 청명 "화산파의 제자").
+ */
+function makeLinkContext(entries) {
+    const s = getSettings();
+    const byUid = new Map(entries.map((e) => [String(e.uid), e]));
+    const keyIndex = [];
+    for (const e of entries) {
+        for (const k of e.key || []) {
+            if (isRegexKey(k)) continue;
+            const n = norm(k);
+            if (n.length >= 2) keyIndex.push({ uid: String(e.uid), n });
+        }
+    }
+    const links = new Map();
+    const indeg = new Map();
+    for (const e of entries) {
+        const hay = norm(`${e.comment || ''}\n${e.content || ''}`);
+        const set = new Set();
+        for (const { uid, n } of keyIndex) if (uid !== String(e.uid) && hay.includes(n)) set.add(uid);
+        links.set(String(e.uid), set);
+        for (const u of set) indeg.set(u, (indeg.get(u) || 0) + 1);
+    }
+    const cap = clampInt(s.overviewChars, 500, 50000, 4000);
+    let overview = '';
+    for (const e of [...entries].sort((a, b) => (indeg.get(String(b.uid)) || 0) - (indeg.get(String(a.uid)) || 0))) {
+        const keys = (e.key || []).filter((k) => !isRegexKey(k));
+        if (!keys.length) continue;
+        const line = `- ${entryTitle(e).slice(0, 40)}: ${keys.join(', ')}\n`;
+        if (overview.length + line.length > cap) { overview += '- …(이하 생략)\n'; break; }
+        overview += line;
+    }
+    return { byUid, links, indeg, overview: overview.trim(), decided: new Map() /* keyword → Map(lang → [t]) */ };
+}
+
+/** Related-entry lines for one entry: what it mentions, with translations already decided. */
+function relatedLines(entry, link, langs) {
+    const out = [];
+    for (const uid of [...(link.links.get(String(entry.uid)) || [])].slice(0, 8)) {
+        const re = link.byUid.get(uid);
+        if (!re) continue;
+        const keys = (re.key || []).filter((k) => !isRegexKey(k));
+        const dec = [];
+        for (const l of langs) {
+            const ts = [...new Set(keys.flatMap((k) => link.decided.get(k)?.get(l) || []))];
+            if (ts.length) dec.push(`${l}: ${ts.join(', ')}`);
+        }
+        out.push(`  · ${entryTitle(re).slice(0, 40)} [${keys.join(', ')}]${dec.length ? ` → ${dec.join(' / ')}` : ''}`);
+    }
+    return out;
+}
+
+/**
+ * Consistency check across the whole result (free): when a keyword contains another one
+ * (화산파 ⊃ 화산), the longer one's translation should contain the shorter one's (华山派 ⊃ 华山).
+ * Both sides get flagged, since either could be the wrong one.
+ */
+function markInconsistent(rows, results, langs) {
+    const srcs = new Set();
+    for (const r of rows) for (const adds of Object.values(r.adds)) for (const a of adds) srcs.add(a.src);
+    const list = [...srcs].filter((x) => norm(x).length >= 2);
+    const tr = (src, l) => (results.get(`${l}\0${src}`) || []).map(cleanResult).filter(Boolean);
+    const issues = new Map(); // `${src}\0${lang}` → [messages]
+    const add = (src, l, msg) => { const k = `${src}\0${l}`; if (!issues.has(k)) issues.set(k, []); issues.get(k).push(msg); };
+    for (const long of list) {
+        for (const short of list) {
+            if (short === long || !norm(long).includes(norm(short)) || scriptOf(short) !== scriptOf(long)) continue;
+            for (const l of langs) {
+                const tl = tr(long, l), ts = tr(short, l);
+                if (!tl.length || !ts.length) continue;
+                if (tl.some((x) => ts.some((y) => norm(x).includes(norm(y))))) continue;
+                add(long, l, `"${short}" → ${ts.join('/')} 와 안 맞아요`);
+                add(short, l, `"${long}" → ${tl.join('/')} 와 안 맞아요`);
+            }
+        }
+    }
+    for (const r of rows) for (const adds of Object.values(r.adds)) for (const a of adds) {
+        const msgs = issues.get(`${a.src}\0${a.lang}`);
+        a.mismatch = msgs ? msgs.slice(0, 2).join(', ') : undefined;
+    }
+}
+
 /** Groups need-map keywords by entry and splits them into request-sized chunks (by keyword count and size). */
-function buildAIChunks(need) {
+function buildAIChunks(need, link = null) {
     const s = getSettings();
     const limit = clampInt(s.aiBatch, 5, 100, SPEED_DEFAULTS.aiBatch);
     const maxChars = clampInt(s.aiChunkChars, 3000, 100000, SPEED_DEFAULTS.aiChunkChars);
@@ -374,13 +461,17 @@ function buildAIChunks(need) {
     }
     const chunks = [];
     let cur = [], n = 0, size = 0;
-    for (const g of groups.values()) {
-        const ctxSize = entryContext(g.entry).length + 200;
+    // with links: translate the most-referenced entries first, so others can reuse their translations
+    const ordered = [...groups.values()];
+    if (link) ordered.sort((a, b) => (link.indeg.get(String(b.entry.uid)) || 0) - (link.indeg.get(String(a.entry.uid)) || 0));
+    const budget = link ? Math.max(2000, maxChars - link.overview.length) : maxChars;
+    for (const g of ordered) {
+        const ctxSize = entryContext(g.entry).length + 200 + (link ? 120 * Math.min(8, link.links.get(String(g.entry.uid))?.size || 0) : 0);
         // keep an entry's keywords together, but never let one huge entry blow past the limit
         for (let i = 0; i < g.texts.length; i += limit) {
             const piece = { entry: g.entry, texts: g.texts.slice(i, i + limit) };
             const pieceSize = ctxSize + piece.texts.join('').length + piece.texts.length * 6;
-            if (cur.length && (n + piece.texts.length > limit || size + pieceSize > maxChars)) { chunks.push(cur); cur = []; n = 0; size = 0; }
+            if (cur.length && (n + piece.texts.length > limit || size + pieceSize > budget)) { chunks.push(cur); cur = []; n = 0; size = 0; }
             cur.push(piece); n += piece.texts.length; size += pieceSize;
         }
     }
@@ -388,7 +479,7 @@ function buildAIChunks(need) {
     return chunks;
 }
 
-function buildAIPrompt(groups, langs) {
+function buildAIPrompt(groups, langs, link = null) {
     const s = getSettings();
     const langDesc = langs.map((l) => `"${l}" (${langEn(l)})`).join(', ');
     const lines = [];
@@ -397,15 +488,27 @@ function buildAIPrompt(groups, langs) {
         lines.push('', `[Entry] ${entryTitle(g.entry).slice(0, 60)}`);
         const others = (g.entry.key || []).concat(g.entry.keysecondary || []).filter((k) => !isRegexKey(k));
         if (others.length > 1) lines.push(`All keywords of this entry: ${others.join(', ')}`);
+        if (link) {
+            const rel = relatedLines(g.entry, link, langs);
+            if (rel.length) lines.push('Related entries (mentioned by this entry):', ...rel);
+        }
         const content = entryContext(g.entry);
         if (content) lines.push(`Content: ${content}`);
         for (const t of g.texts) { order.push(t); lines.push(`${order.length}. ${t}`); }
     }
+    const linkPart = link ? [
+        '',
+        'These entries belong to one connected lorebook. Use the overview and related entries to understand relationships, and keep shared parts consistent: if a related entry already has a translation (shown after →), reuse it inside compound names (e.g. 화산 → 华山 means 화산파 → 华山派, not 火山派).',
+        '',
+        'Lorebook overview (entry: keywords):',
+        link.overview,
+    ] : [];
     const prompt = [
         `Target languages: ${langDesc}.`,
         '',
         (s.aiRules || DEFAULT_RULES).trim(),
         s.aiHint ? `\n세계관 메모: ${s.aiHint}` : '',
+        ...linkPart,
         '',
         'Return ONLY a JSON object, no commentary. Keys are the numbers of the keywords below; each value maps target language codes to arrays of strings, plus optional "unsure": true, like {"1": {"zh-CN": ["..."]}, "2": {"zh-CN": ["...", "..."], "unsure": true}}.',
         ...lines,
@@ -414,14 +517,14 @@ function buildAIPrompt(groups, langs) {
 }
 
 /** need: Map(lang → Map(text → entry)); fills out: Map(`${lang}\0${text}` → string[]) */
-async function aiTranslateNeed(need, progress, isCancelled, out = new Map()) {
+async function aiTranslateNeed(need, progress, isCancelled, out = new Map(), link = null) {
     const delay = clampInt(getSettings().aiDelay, 0, 60000, SPEED_DEFAULTS.aiDelay);
     const langs = [...need.keys()].filter((l) => need.get(l).size);
-    const chunks = buildAIChunks(need);
+    const chunks = buildAIChunks(need, link);
     for (let i = 0; i < chunks.length; i++) {
         if (isCancelled()) break;
         if (i > 0) await sleep(delay);
-        const { prompt, order } = buildAIPrompt(chunks[i], langs);
+        const { prompt, order } = buildAIPrompt(chunks[i], langs, link);
         const json = await callAIJson(prompt, Math.min(8000, 400 + order.length * langs.length * 40));
         order.forEach((t, j) => {
             const row = json[String(j + 1)];
@@ -430,7 +533,13 @@ async function aiTranslateNeed(need, progress, isCancelled, out = new Map()) {
             for (const l of langs) {
                 if (!need.get(l).has(t)) continue;
                 const v = row[l];
-                out.set(`${l}\0${t}`, (Array.isArray(v) ? v : (v ? [v] : [])).map(String));
+                const arr = (Array.isArray(v) ? v : (v ? [v] : [])).map(String);
+                out.set(`${l}\0${t}`, arr);
+                if (link && arr.length) {
+                    const m = link.decided.get(t) ?? new Map();
+                    m.set(l, arr.map(cleanResult).filter(Boolean));
+                    link.decided.set(t, m);
+                }
             }
         });
         progress(order.length);
@@ -763,9 +872,13 @@ async function openTranslator(presetBook) {
     snippetNum.addEventListener('change', () => { snippetNum.value = s.contentChars; });
     const snippetBox = el('span', { class: 'wikt-inline' }, '앞 ', snippetNum, '자');
     const ctxNote = el('small', { class: 'wikt-note' });
+    const linkCb = el('input', { type: 'checkbox', checked: s.aiLinked });
+    linkCb.addEventListener('change', () => { s.aiLinked = linkCb.checked; save(); });
     const ctxBox = el('div', { class: 'wikt-ctxbox' },
         el('div', { class: 'wikt-row' }, el('b', { text: 'AI에게 보낼 정보' }), ctxRadios[0], ctxRadios[1], snippetBox, ctxRadios[2]),
-        ctxNote);
+        ctxNote,
+        el('div', { class: 'wikt-row' }, el('label', {}, linkCb, ' 엔트리 연결 고려'),
+            el('small', { class: 'wikt-note', text: '로어북 전체 목록 + 이 엔트리가 언급하는 다른 엔트리 + 이미 정한 번역을 같이 보내서, 서로 연결된 이름을 일관되게 번역해요 (예: 화산 → 华山이면 화산파 → 华山派). 많이 언급되는 엔트리부터 번역해요. 요청마다 목록이 붙어서 토큰이 조금 늘어요.' })));
     const hintBox = el('div', { class: 'wikt-hint' }, el('small', { text: 'AI에게 줄 세계관 메모 (선택)' }), hintArea);
     const aiInfo = el('small', { class: 'wikt-note' });
 
@@ -1212,13 +1325,17 @@ async function openTranslator(presetBook) {
         const aiMain = provider === 'ai';
         const aiCompare = s.verifyCompare && !aiMain;
         const aiBack = s.verifyBack && s.backProvider === 'ai';
+        // link context is built from the whole book (not just the selected entries), so relations outside the scope still help
+        const makeLink = () => (s.aiLinked ? makeLinkContext(entriesOf(state.data)) : null);
         if (aiMain || aiCompare || aiBack) {
             const uniq = new Set([...need.values()].flatMap((m) => [...m.keys()]));
             const langsUsed = [...need.keys()].filter((l) => need.get(l).size);
-            const chunks = buildAIChunks(need);
-            const chars = chunks.reduce((a, g) => a + AI_SYSTEM.length + buildAIPrompt(g, langsUsed).prompt.length, 0);
+            const link = makeLink();
+            const chunks = buildAIChunks(need, link);
+            const chars = chunks.reduce((a, g) => a + AI_SYSTEM.length + buildAIPrompt(g, langsUsed, link).prompt.length, 0);
             const uses = [aiMain ? '번역' : null, aiCompare ? '교차 비교' : null, aiBack ? '역번역' : null].filter(Boolean).join(' + ');
-            const what = `키워드 ${uniq.size}개 + 엔트리 제목` + ({ keywords: ' (본문 X)', snippet: ` + 본문 앞 ${s.contentChars}자`, full: ' + 월드인포 전문' })[s.aiContext];
+            const what = `키워드 ${uniq.size}개 + 엔트리 제목` + ({ keywords: ' (본문 X)', snippet: ` + 본문 앞 ${s.contentChars}자`, full: ' + 월드인포 전문' })[s.aiContext] +
+                (link ? ' + 로어북 목록·연결' : '');
             const msg = `${profileName()}로 AI ${uses}을 해요.\n번역 단계: ${what}, 요청 ${chunks.length}번 · 약 ${chars.toLocaleString()}자` +
                 (aiBack ? '\n역번역 단계: 번역 결과 개수만큼 추가 요청' : '') + '\n진행할까요?';
             const ok = await c.Popup.show.confirm('AI 사용 확인', msg);
@@ -1231,14 +1348,14 @@ async function openTranslator(presetBook) {
         let other = null;
         const back = new Map();
         try {
-            if (aiMain) await aiTranslateNeed(need, phase('AI 번역 중', total), isCancelled, results);
+            if (aiMain) await aiTranslateNeed(need, phase('AI 번역 중', total), isCancelled, results, makeLink());
             else await freeTranslateNeed(provider, need, phase('번역 중', total), isCancelled, results);
 
             if (s.verifyCompare && !isCancelled()) {
                 await gap(aiMain ? 'free' : 'ai');
                 other = new Map();
                 if (aiMain) await freeTranslateNeed('google', need, phase('비교용 Google 번역 중', total), isCancelled, other);
-                else await aiTranslateNeed(need, phase('비교용 AI 번역 중', total), isCancelled, other);
+                else await aiTranslateNeed(need, phase('비교용 AI 번역 중', total), isCancelled, other, makeLink());
             }
         } catch (e) {
             reportError(e, '번역 중단');
@@ -1267,6 +1384,7 @@ async function openTranslator(presetBook) {
             }
             if (Object.keys(row.adds).length) state.rows.push(row);
         }
+        markInconsistent(state.rows, results, langs);
 
         // back-translation of every proposed keyword into its source keyword's language
         if (s.verifyBack && !isCancelled() && state.rows.length) {
@@ -1314,6 +1432,7 @@ async function openTranslator(presetBook) {
     // Cross-check beats back-translation: if both methods agree, a mismatching back-translation
     // (e.g. romanized names like Cheongmyeong → 清明 → Qingming) is not a warning.
     function isSuspicious(a) {
+        if (a.mismatch && a.orig == null) return true; // compound/short keyword translations disagree
         if (a.alt != null) return !cmpOk(a);
         if (a.orig != null) return false;
         if (a.unsure) return true;
@@ -1326,7 +1445,7 @@ async function openTranslator(presetBook) {
     }
 
     function renderChecks(adds, inp, onChange) {
-        const anyCheck = adds.some((a) => a.back != null || a.alt != null || a.hits != null || a.unsure);
+        const anyCheck = adds.some((a) => a.back != null || a.alt != null || a.hits != null || a.unsure || a.mismatch);
         if (!anyCheck) return null;
         const box = el('div', { class: 'wikt-checks' });
         const refreshWarn = () => box.closest('.wikt-item')?.classList.toggle('has-warn', adds.some(isSuspicious));
@@ -1345,6 +1464,7 @@ async function openTranslator(presetBook) {
             const parts = [el('b', { text: a.t }), el('small', { class: 'wikt-src', text: ` ← ${a.src} · ${langLabel(a.lang)}` })];
             if (a.hits != null) parts.push(el('small', { class: a.hits ? 'wikt-ok' : 'wikt-src', text: ` · 채팅 ${a.hits}회` }));
             if (a.unsure && a.orig == null) parts.push(el('small', { class: 'wikt-bad', text: ' · AI가 확신 못함 — 후보 중 맞는 것만 남기세요' }));
+            if (a.mismatch && a.orig == null) parts.push(el('small', { class: 'wikt-bad', text: ` · 연결 불일치: ${a.mismatch} (둘 중 하나가 틀렸을 수 있어요)` }));
             // back-translation belongs to the original text; hide it while a swapped value is shown
             if (a.back != null && a.orig == null) parts.push(el('small', { class: backOk(a) ? 'wikt-ok' : (bad ? 'wikt-bad' : 'wikt-src'), text: ` · 역번역: ${a.back || '(없음)'}` }));
             let chip;
