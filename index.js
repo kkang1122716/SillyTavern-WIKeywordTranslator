@@ -25,12 +25,28 @@ const PROVIDERS = {
 };
 
 const DEFAULT_RULES = [
+    '아래는 롤플레이 로어북(월드인포)의 트리거 키워드야. 롤플레이 본문에 실제로 등장할 표기로 번역해.',
+    '- 한국어 키워드는 소리만 적혀 있어서 한자가 여러 개일 수 있어(예: 청명 → 清明/晴明/青冥). 같은 엔트리의 제목·다른 키워드·내용을 근거로 가장 맞는 뜻을 골라.',
+    '- 인물·문파·지명·무공·물건 같은 고유명사는 소리만 옮기지 말고, 그 작품/장르에서 쓰는 정식 표기로 써. 유명 작품의 고유명사면 원작 표기를 따라.',
+    '- 일반 명사는 그 언어 원어민이 본문에서 실제로 쓰는 단어로 써.',
+    '- 가장 좋은 표기 하나만 주고, 흔히 쓰이는 다른 표기가 있을 때만 하나 더 줘.',
+    '- 근거가 부족해서 확신이 없으면 후보를 2개까지 주고 그 항목에 "unsure": true를 붙여.',
+    '- 엔트리 제목/내용은 뜻을 고르기 위한 참고용이야. 그 자체는 번역하지 마.',
+    '- 이미 목표 언어로 된 키워드는 그대로 돌려줘.',
+].join('\n');
+/** Default prompt of 1.0.0–1.0.6; a saved copy of it is treated as "default" so users get the new one. */
+const OLD_DEFAULT_RULES = [
     '아래는 롤플레이 로어북(월드인포)의 트리거 키워드야. 롤플레이 본문에서 실제로 쓰일 표기로 번역해.',
     '- 인물·문파·지명·무공·물건 같은 고유명사는 소리만 옮기지 말고, 그 언어권에서 자연스럽게 쓰는 정식 표기(동아시아 이름은 알맞은 한자)로 써.',
     '- 엔트리 제목/내용은 뜻을 고르기 위한 참고용이야. 그 자체는 번역하지 마.',
     '- 가장 좋은 표기 하나만 주고, 흔히 쓰이는 다른 표기가 있을 때만 하나 더 줘.',
     '- 이미 목표 언어로 된 키워드는 그대로 돌려줘.',
 ].join('\n');
+const AI_CONTEXTS = {
+    keywords: '키워드만 (제목 + 같은 엔트리의 다른 키워드)',
+    snippet: '본문 일부',
+    full: '월드인포 전문',
+};
 
 const AI_SYSTEM = 'You are a precise translation engine for roleplay lorebook keywords. Output only valid JSON.';
 const AI_SYSTEM_DIAG = 'You analyze roleplay text against lorebook entries. Output only valid JSON.';
@@ -43,6 +59,7 @@ const SPEED_DEFAULTS = Object.freeze({
     aiDelay: 1500,       // ms between AI requests
     chatEntries: 60,     // entries per AI diagnosis request
     diagChunkChars: 8000, // chat chars per AI diagnosis request
+    aiChunkChars: 12000, // max prompt chars per AI translation request (matters with content sent)
 });
 
 const defaultSettings = Object.freeze({
@@ -52,7 +69,8 @@ const defaultSettings = Object.freeze({
     aiHint: '',
     aiProfile: '',      // '' = current connection
     aiRules: '',        // '' = DEFAULT_RULES
-    contentChars: 0,    // 0 = don't send entry content
+    aiContext: 'keywords', // what AI translation sees: 'keywords' | 'snippet' | 'full'
+    contentChars: 300,  // snippet length for aiContext 'snippet'
     verifyBack: false,
     backProvider: 'free', // 'free' (Google/Bing) | 'ai'
     verifyCompare: false,
@@ -87,6 +105,12 @@ function getSettings() {
     const { extensionSettings } = ctx();
     if (!extensionSettings[MODULE]) extensionSettings[MODULE] = structuredClone(defaultSettings);
     const s = extensionSettings[MODULE];
+    // 1.0.7 migration: "content chars > 0" used to mean "send a snippet"
+    if (!Object.hasOwn(s, 'aiContext')) {
+        s.aiContext = Number(s.contentChars) > 0 ? 'snippet' : 'keywords';
+        if (!(Number(s.contentChars) > 0)) s.contentChars = defaultSettings.contentChars;
+    }
+    if (s.aiRules && s.aiRules.trim() === OLD_DEFAULT_RULES) s.aiRules = '';
     for (const k of Object.keys(defaultSettings)) {
         if (!Object.hasOwn(s, k)) s[k] = structuredClone(defaultSettings[k]);
     }
@@ -325,9 +349,22 @@ async function callAIJson(prompt, maxTokens, system) {
     }
 }
 
-/** Groups need-map keywords by entry and splits them into request-sized chunks. */
+/** Entry content sent with AI translation, per the "보낼 정보" choice ('' for keywords only). */
+function entryContext(e) {
+    const s = getSettings();
+    const text = String(e.content || '').replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
+    if (!text || s.aiContext === 'keywords') return '';
+    if (s.aiContext === 'snippet') return text.slice(0, clampInt(s.contentChars, 50, 5000, 300));
+    // full: cap so a single giant entry still fits into one request
+    const cap = Math.max(1000, clampInt(s.aiChunkChars, 3000, 100000, SPEED_DEFAULTS.aiChunkChars) - 2000);
+    return text.length > cap ? `${text.slice(0, cap)} …(이하 생략)` : text;
+}
+
+/** Groups need-map keywords by entry and splits them into request-sized chunks (by keyword count and size). */
 function buildAIChunks(need) {
-    const limit = clampInt(getSettings().aiBatch, 5, 100, SPEED_DEFAULTS.aiBatch);
+    const s = getSettings();
+    const limit = clampInt(s.aiBatch, 5, 100, SPEED_DEFAULTS.aiBatch);
+    const maxChars = clampInt(s.aiChunkChars, 3000, 100000, SPEED_DEFAULTS.aiChunkChars);
     const byText = new Map(); // text → entry (first one wins)
     for (const m of need.values()) for (const [t, e] of m) if (!byText.has(t)) byText.set(t, e);
     const groups = new Map(); // uid → {entry, texts}
@@ -336,13 +373,15 @@ function buildAIChunks(need) {
         groups.get(e.uid).texts.push(t);
     }
     const chunks = [];
-    let cur = [], n = 0;
+    let cur = [], n = 0, size = 0;
     for (const g of groups.values()) {
+        const ctxSize = entryContext(g.entry).length + 200;
         // keep an entry's keywords together, but never let one huge entry blow past the limit
         for (let i = 0; i < g.texts.length; i += limit) {
             const piece = { entry: g.entry, texts: g.texts.slice(i, i + limit) };
-            if (cur.length && n + piece.texts.length > limit) { chunks.push(cur); cur = []; n = 0; }
-            cur.push(piece); n += piece.texts.length;
+            const pieceSize = ctxSize + piece.texts.join('').length + piece.texts.length * 6;
+            if (cur.length && (n + piece.texts.length > limit || size + pieceSize > maxChars)) { chunks.push(cur); cur = []; n = 0; size = 0; }
+            cur.push(piece); n += piece.texts.length; size += pieceSize;
         }
     }
     if (cur.length) chunks.push(cur);
@@ -356,9 +395,10 @@ function buildAIPrompt(groups, langs) {
     const order = [];
     for (const g of groups) {
         lines.push('', `[Entry] ${entryTitle(g.entry).slice(0, 60)}`);
-        if (s.contentChars > 0 && g.entry.content) {
-            lines.push(`Content: ${String(g.entry.content).replace(/\s+/g, ' ').slice(0, s.contentChars)}`);
-        }
+        const others = (g.entry.key || []).concat(g.entry.keysecondary || []).filter((k) => !isRegexKey(k));
+        if (others.length > 1) lines.push(`All keywords of this entry: ${others.join(', ')}`);
+        const content = entryContext(g.entry);
+        if (content) lines.push(`Content: ${content}`);
         for (const t of g.texts) { order.push(t); lines.push(`${order.length}. ${t}`); }
     }
     const prompt = [
@@ -367,7 +407,7 @@ function buildAIPrompt(groups, langs) {
         (s.aiRules || DEFAULT_RULES).trim(),
         s.aiHint ? `\n세계관 메모: ${s.aiHint}` : '',
         '',
-        'Return ONLY a JSON object, no commentary. Keys are the keyword numbers below; values map each target language code to an array of strings, like {"1": {"zh-CN": ["..."]}, "2": {...}}.',
+        'Return ONLY a JSON object, no commentary. Keys are the numbers of the keywords below; each value maps target language codes to arrays of strings, plus optional "unsure": true, like {"1": {"zh-CN": ["..."]}, "2": {"zh-CN": ["...", "..."], "unsure": true}}.',
         ...lines,
     ].join('\n');
     return { prompt, order };
@@ -386,6 +426,7 @@ async function aiTranslateNeed(need, progress, isCancelled, out = new Map()) {
         order.forEach((t, j) => {
             const row = json[String(j + 1)];
             if (!row || typeof row !== 'object') return;
+            if (row.unsure === true || row.unsure === 'true') out.set(`?\0${t}`, true); // AI wasn't sure about this keyword
             for (const l of langs) {
                 if (!need.get(l).has(t)) continue;
                 const v = row[l];
@@ -711,6 +752,20 @@ async function openTranslator(presetBook) {
 
     const hintArea = el('textarea', { class: 'text_pole', rows: 2, placeholder: '예: 한국 무협 세계관(화산귀환풍). 인물·문파 이름은 한자 표기로.', value: s.aiHint });
     hintArea.addEventListener('input', () => { s.aiHint = hintArea.value; save(); });
+    // what the AI gets to see when translating
+    const ctxRadios = Object.entries(AI_CONTEXTS).map(([k, label]) => {
+        const r = el('input', { type: 'radio', name: 'wikt_ctx', value: k, checked: s.aiContext === k });
+        r.addEventListener('change', () => { if (r.checked) { s.aiContext = k; save(); updateVisibility(); } });
+        return el('label', {}, r, ` ${label}`);
+    });
+    const snippetNum = el('input', { class: 'text_pole wikt-num', type: 'number', min: 50, max: 5000, step: 50, value: s.contentChars });
+    snippetNum.addEventListener('input', () => { s.contentChars = clampInt(snippetNum.value, 50, 5000, 300); save(); });
+    snippetNum.addEventListener('change', () => { snippetNum.value = s.contentChars; });
+    const snippetBox = el('span', { class: 'wikt-inline' }, '앞 ', snippetNum, '자');
+    const ctxNote = el('small', { class: 'wikt-note' });
+    const ctxBox = el('div', { class: 'wikt-ctxbox' },
+        el('div', { class: 'wikt-row' }, el('b', { text: 'AI에게 보낼 정보' }), ctxRadios[0], ctxRadios[1], snippetBox, ctxRadios[2]),
+        ctxNote);
     const hintBox = el('div', { class: 'wikt-hint' }, el('small', { text: 'AI에게 줄 세계관 메모 (선택)' }), hintArea);
     const aiInfo = el('small', { class: 'wikt-note' });
 
@@ -732,6 +787,16 @@ async function openTranslator(presetBook) {
         const usesAI = provSel.value === 'ai' || (cmpCb.checked && otherIsAI) || (backCb.checked && backSel.value === 'ai');
         hintBox.style.display = usesAI ? '' : 'none';
         aiInfo.textContent = usesAI ? `AI 연결: ${profileName()} · 바꾸려면 설정 탭` : '';
+        snippetBox.style.display = s.aiContext === 'snippet' ? '' : 'none';
+        const aiTranslates = provSel.value === 'ai' || (cmpCb.checked && otherIsAI);
+        ctxBox.classList.toggle('wikt-dim', !aiTranslates);
+        ctxNote.textContent = !aiTranslates
+            ? 'Google/Bing은 키워드를 한 단어씩 따로 번역해서 이 선택이 적용되지 않아요. 고유명사가 중요하면 번역 방식을 AI로 바꾸거나 교차 비교(AI)를 켜 주세요.'
+            : ({
+                keywords: '가장 저렴해요. 제목과 같은 엔트리의 다른 키워드로만 뜻을 추측해서, 소리만 같은 한자(청명 → 清明/晴明)를 헷갈릴 수 있어요.',
+                snippet: '엔트리 설명 앞부분을 근거로 써요. 보통 이 정도면 고유명사를 잘 잡아요. 토큰은 키워드만보다 몇 배 늘어요.',
+                full: '엔트리 내용 전체를 보내요. 가장 정확하지만 토큰이 가장 많이 들어요. (본문은 AI 연결로만 가고 구글/빙으로는 절대 안 가요)',
+            })[s.aiContext];
     }
     cmpCb.addEventListener('change', () => { s.verifyCompare = cmpCb.checked; save(); updateVisibility(); });
     provSel.addEventListener('change', () => { s.provider = provSel.value; save(); updateVisibility(); });
@@ -749,6 +814,7 @@ async function openTranslator(presetBook) {
         el('div', { class: 'wikt-row' }, el('b', { text: '검증' }),
             el('label', {}, backCb, ' 역번역 표시'), backSel),
         el('div', { class: 'wikt-row' }, el('b', { text: '' }), el('label', {}, cmpCb, cmpLabelText)),
+        ctxBox,
         hintBox,
         aiInfo,
         el('small', { class: 'wikt-note', text: '항상 켜짐(파란불) 엔트리와 정규식(/.../) 키워드는 건너뛰어요. 로어북과 범위(전체/선택)는 진단 탭에도 똑같이 적용돼요.' }),
@@ -792,7 +858,7 @@ async function openTranslator(presetBook) {
         el('div', { class: 'wikt-row' }, profSel),
         profNote,
         el('h4', { text: 'AI에 보내는 내용' }),
-        numField('엔트리 본문 앞부분 (글자 수)', 'contentChars', 0, 2000, 50, '0 = 안 보냄(기본). 켜면 고유명사 정확도↑ 토큰↑. 본문은 AI로만 가고 구글/빙으로는 절대 안 가요.'),
+        el('small', { class: 'wikt-note', text: '키워드만 / 본문 일부 / 월드인포 전문 선택은 번역 탭에 있어요. 본문은 AI 연결로만 가고 구글/빙으로는 절대 안 가요.' }),
         el('details', {},
             el('summary', { text: '번역 프롬프트 보기/수정' }),
             rulesArea,
@@ -804,6 +870,7 @@ async function openTranslator(presetBook) {
         numField('무료 번역: 요청 사이 대기 (ms)', 'freeDelay', 0, 30000, 100, `추천 ${SPEED_DEFAULTS.freeDelay} · 1000ms = 1초`),
         numField('AI: 한 번에 보내는 키워드 수', 'aiBatch', 5, 100, 1, `추천 ${SPEED_DEFAULTS.aiBatch} · 크면 요청 수↓ 대신 응답이 잘리거나 형식이 깨질 수 있어요`),
         numField('AI: 요청 사이 대기 (ms)', 'aiDelay', 0, 60000, 100, `추천 ${SPEED_DEFAULTS.aiDelay}`),
+        numField('AI 번역: 한 번에 보내는 최대 글자 수', 'aiChunkChars', 3000, 100000, 1000, `추천 ${SPEED_DEFAULTS.aiChunkChars} · 본문/전문을 보낼 때 이 크기를 넘으면 나눠서 보내요`),
         numField('AI 진단: 한 번에 보내는 채팅 글자 수', 'diagChunkChars', 1000, 60000, 500, `추천 ${SPEED_DEFAULTS.diagChunkChars} · 범위가 길면 이 크기로 나눠서 보내요`),
         numField('AI 진단: 한 번에 보내는 엔트리 수', 'chatEntries', 5, 200, 5, `추천 ${SPEED_DEFAULTS.chatEntries}`),
         el('div', { class: 'wikt-row' }, el('div', {
@@ -1151,7 +1218,7 @@ async function openTranslator(presetBook) {
             const chunks = buildAIChunks(need);
             const chars = chunks.reduce((a, g) => a + AI_SYSTEM.length + buildAIPrompt(g, langsUsed).prompt.length, 0);
             const uses = [aiMain ? '번역' : null, aiCompare ? '교차 비교' : null, aiBack ? '역번역' : null].filter(Boolean).join(' + ');
-            const what = s.contentChars > 0 ? `키워드 ${uniq.size}개 + 엔트리 제목 + 본문 앞 ${s.contentChars}자` : `키워드 ${uniq.size}개 + 엔트리 제목 (본문 X)`;
+            const what = `키워드 ${uniq.size}개 + 엔트리 제목` + ({ keywords: ' (본문 X)', snippet: ` + 본문 앞 ${s.contentChars}자`, full: ' + 월드인포 전문' })[s.aiContext];
             const msg = `${profileName()}로 AI ${uses}을 해요.\n번역 단계: ${what}, 요청 ${chunks.length}번 · 약 ${chars.toLocaleString()}자` +
                 (aiBack ? '\n역번역 단계: 번역 결과 개수만큼 추가 요청' : '') + '\n진행할까요?';
             const ok = await c.Popup.show.confirm('AI 사용 확인', msg);
@@ -1192,7 +1259,7 @@ async function openTranslator(presetBook) {
                             if (!t || seen.has(norm(t))) continue;
                             seen.add(norm(t));
                             const alt = other ? (other.get(`${l}\0${src}`) || []).map(cleanResult).filter(Boolean) : null;
-                            adds.push({ t, src, lang: l, alt });
+                            adds.push({ t, src, lang: l, alt, unsure: results.has(`?\0${src}`) || undefined });
                         }
                     }
                 }
@@ -1249,6 +1316,7 @@ async function openTranslator(presetBook) {
     function isSuspicious(a) {
         if (a.alt != null) return !cmpOk(a);
         if (a.orig != null) return false;
+        if (a.unsure) return true;
         return a.back != null && !backOk(a);
     }
 
@@ -1258,7 +1326,7 @@ async function openTranslator(presetBook) {
     }
 
     function renderChecks(adds, inp, onChange) {
-        const anyCheck = adds.some((a) => a.back != null || a.alt != null || a.hits != null);
+        const anyCheck = adds.some((a) => a.back != null || a.alt != null || a.hits != null || a.unsure);
         if (!anyCheck) return null;
         const box = el('div', { class: 'wikt-checks' });
         const refreshWarn = () => box.closest('.wikt-item')?.classList.toggle('has-warn', adds.some(isSuspicious));
@@ -1276,6 +1344,7 @@ async function openTranslator(presetBook) {
             const bad = isSuspicious(a);
             const parts = [el('b', { text: a.t }), el('small', { class: 'wikt-src', text: ` ← ${a.src} · ${langLabel(a.lang)}` })];
             if (a.hits != null) parts.push(el('small', { class: a.hits ? 'wikt-ok' : 'wikt-src', text: ` · 채팅 ${a.hits}회` }));
+            if (a.unsure && a.orig == null) parts.push(el('small', { class: 'wikt-bad', text: ' · AI가 확신 못함 — 후보 중 맞는 것만 남기세요' }));
             // back-translation belongs to the original text; hide it while a swapped value is shown
             if (a.back != null && a.orig == null) parts.push(el('small', { class: backOk(a) ? 'wikt-ok' : (bad ? 'wikt-bad' : 'wikt-src'), text: ` · 역번역: ${a.back || '(없음)'}` }));
             let chip;

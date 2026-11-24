@@ -45,4 +45,8 @@
 .wikt-clean { border: 1px solid var(--SmartThemeBorderColor); border-radius: 8px; padding: 6px 8px; margin-top: 8px; }
 .wikt-clean summary { cursor: pointer; font-weight: bold; }
 .wikt-clean > .wikt-row, .wikt-clean > small { margin-top: 6px; }
+.wikt-ctxbox { border: 1px solid var(--SmartThemeBorderColor); border-radius: 8px; padding: 6px 8px; display: flex; flex-direction: column; gap: 4px; }
+.wikt-ctxbox.wikt-dim > .wikt-row { opacity: 0.55; }
+.wikt-inline { display: inline-flex; align-items: center; gap: 4px; }
+.wikt-root .wikt-inline input.wikt-num { flex: 0 0 80px; width: 80px; }
 .wikt-root .menu_button.disabled { opacity: 0.5; pointer-events: none; }
