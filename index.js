@@ -55,6 +55,9 @@ const defaultSettings = Object.freeze({
     verifyCompare: false,
     chatMsgs: 30,
     chatChars: 8000,
+    diagMsgs: 100,      // recent messages checked by the diagnose tab
+    diagScope: 'added', // 'added' (only keywords this extension added) | 'all'
+    diagSecondary: false,
     ...SPEED_DEFAULTS,
     wiButton: true,
 });
@@ -416,6 +419,34 @@ async function popUndo() {
     try { await lf().setItem(UNDO_KEY, list); } catch { /* ignore */ }
 }
 
+// ---------- registry of keywords this extension added: { book: { "uid:field": [words] } } ----------
+const ADDED_KEY = 'wikt_added_v1';
+async function loadAdded() {
+    try { return (await lf().getItem(ADDED_KEY)) || {}; } catch { return {}; }
+}
+async function updateAdded(book, words, add) {
+    const reg = await loadAdded();
+    const b = (reg[book] ??= {});
+    for (const [uid, fields] of Object.entries(words)) {
+        for (const [f, list] of Object.entries(fields)) {
+            const k = `${uid}:${f}`;
+            const cur = new Set(b[k] || []);
+            for (const w of list) add ? cur.add(w) : cur.delete(w);
+            if (cur.size) b[k] = [...cur]; else delete b[k];
+        }
+    }
+    try { await lf().setItem(ADDED_KEY, reg); } catch (e) { console.warn('[WIKT] registry save failed', e); }
+}
+
+/** Counts matches of a /regex/ keyword (1 or 0), safely. */
+function regexHit(k, text) {
+    try {
+        const m = String(k).trim().match(/^\/([\s\S]+)\/([dgimsuvy]*)$/);
+        const flags = m[2].replace('g', '');
+        return new RegExp(m[1], flags.includes('i') ? flags : `${flags}i`).test(text) ? 1 : 0;
+    } catch { return 0; }
+}
+
 function syncOriginal(data, uid, field, value) {
     const oKey = field === 'key' ? 'keys' : 'secondary_keys';
     const o = data.originalData?.entries?.find?.((x) => x.uid == uid);
@@ -486,7 +517,7 @@ async function openTranslator(presetBook) {
     const runBtn = el('div', { class: 'menu_button menu_button_icon' }, el('i', { class: 'fa-solid fa-magnifying-glass' }), el('span', { text: '스캔 & 번역' }));
     const chatBtn = el('div', { class: 'menu_button menu_button_icon', title: '현재 채팅에 실제로 나온 표기를 AI로 찾아서 키워드 후보로 보여줘요' }, el('i', { class: 'fa-solid fa-comments' }), el('span', { text: '채팅에서 실제 표기 찾기 (AI)' }));
     const stopBtn = el('div', { class: 'menu_button', text: '중지', style: 'display:none' });
-    const undoBtn = el('div', { class: 'menu_button menu_button_icon', title: '마지막으로 적용한 키워드 추가를 취소해요' }, el('i', { class: 'fa-solid fa-rotate-left' }), el('span', { text: '마지막 적용 되돌리기' }));
+    const undoBtn = el('div', { class: 'menu_button menu_button_icon', title: '마지막 작업(추가 또는 삭제)을 취소해요' }, el('i', { class: 'fa-solid fa-rotate-left' }), el('span', { text: '마지막 작업 되돌리기' }));
 
     const preview = el('div', { class: 'wikt-preview' });
     const applyBtn = el('div', { class: 'menu_button menu_button_icon wikt-apply', style: 'display:none' }, el('i', { class: 'fa-solid fa-check' }), el('span', { text: '체크한 항목 적용' }));
@@ -588,24 +619,181 @@ async function openTranslator(presetBook) {
     fillProfiles();
     updateVisibility();
 
+    // ===== diagnose tab: keywords that never showed up in the recent chat =====
+    const diagScopeSel = el('select', { class: 'text_pole wikt-inline-select' },
+        el('option', { value: 'added', text: '이 확장이 추가한 키워드만 (추천)' }),
+        el('option', { value: 'all', text: '모든 키워드 (직접 넣은 것 포함)' }));
+    diagScopeSel.value = s.diagScope;
+    diagScopeSel.addEventListener('change', () => { s.diagScope = diagScopeSel.value; save(); refreshDiagBadge(); });
+    const diagSecCb = el('input', { type: 'checkbox', checked: s.diagSecondary });
+    diagSecCb.addEventListener('change', () => { s.diagSecondary = diagSecCb.checked; save(); refreshDiagBadge(); });
+    const diagBookLabel = el('b', {});
+    const diagStatus = el('div', { class: 'wikt-status' });
+    const diagList = el('div', { class: 'wikt-preview' });
+    const diagRunBtn = el('div', { class: 'menu_button menu_button_icon' }, el('i', { class: 'fa-solid fa-stethoscope' }), el('span', { text: '진단 시작' }));
+    const diagDelBtn = el('div', { class: 'menu_button menu_button_icon redWarningBG', style: 'display:none' }, el('i', { class: 'fa-solid fa-trash-can' }), el('span', { text: '체크한 키워드 삭제' }));
+    const diagUndoBtn = el('div', { class: 'menu_button menu_button_icon', onclick: () => doUndo() }, el('i', { class: 'fa-solid fa-rotate-left' }), el('span', { text: '마지막 작업 되돌리기' }));
+
+    const tabDiag = el('div', { class: 'wikt-tab', style: 'display:none' },
+        el('div', { class: 'wikt-row' }, el('b', { text: '로어북' }), diagBookLabel, el('small', { class: 'wikt-note', text: '(번역 탭에서 바꿀 수 있어요)' })),
+        el('div', { class: 'wikt-row' }, el('b', { text: '대상' }), diagScopeSel),
+        numField('최근 메시지 수 (이 안에서 한 번도 안 나오면 표시)', 'diagMsgs', 10, 5000, 10, '추천 100'),
+        el('div', { class: 'wikt-row' }, el('label', {}, diagSecCb, ' 보조 키워드도 점검')),
+        el('small', { class: 'wikt-note', text: '지금 열린 채팅 기준이에요. 같은 엔트리의 다른 키워드는 나왔는데 이 키워드만 안 나왔으면 "삭제 추천"으로 미리 체크해요. 엔트리 자체가 안 나온 경우는 아직 판단하기 일러서 체크하지 않아요. 다른 언어로 채팅할 때 필요한 키워드일 수 있으니 확인 후 삭제하세요.' }),
+        el('div', { class: 'wikt-row' }, diagRunBtn, diagDelBtn, diagUndoBtn),
+        diagStatus,
+        diagList,
+    );
+
+    /** Scans the current book against the recent chat. Returns { rows, recommended, recentCount, total } or null without a chat. */
+    async function diagnose() {
+        if (!state.data) return null;
+        const msgs = chatMessages();
+        if (!msgs.length) return null;
+        const recent = msgs.slice(-clampInt(s.diagMsgs, 10, 5000, 100));
+        const text = recent.join('\n');
+        const hay = norm(text);
+        const reg = (await loadAdded())[state.book] || {};
+        const fields = s.diagSecondary ? ['key', 'keysecondary'] : ['key'];
+        const rows = [];
+        let recommended = 0;
+        for (const e of entriesOf(state.data)) {
+            if (e.constant) continue;
+            const entryHits = (e.key || []).reduce((a, k) => a + (isRegexKey(k) ? regexHit(k, text) : countHits(hay, k)), 0);
+            const items = [];
+            for (const f of fields) {
+                const mine = new Set(reg[`${e.uid}:${f}`] || []);
+                for (const k0 of e[f] || []) {
+                    const k = String(k0);
+                    if (!k.trim() || isRegexKey(k)) continue;
+                    if (s.diagScope === 'added' && !mine.has(k)) continue;
+                    if (countHits(hay, k) > 0) continue;
+                    const recommend = entryHits > 0;
+                    if (recommend) recommended++;
+                    items.push({ f, k, recommend, mine: mine.has(k) });
+                }
+            }
+            if (items.length) rows.push({ uid: String(e.uid), title: entryTitle(e), entryHits, items });
+        }
+        return { rows, recommended, recentCount: recent.length, total: rows.reduce((a, r) => a + r.items.length, 0) };
+    }
+
+    async function refreshDiagBadge() {
+        try {
+            const d = await diagnose();
+            tabBtnD.textContent = d?.recommended ? `진단 (${d.recommended})` : '진단';
+        } catch (e) { console.warn('[WIKT] diag badge', e); }
+    }
+
+    function renderDiag(d) {
+        diagList.replaceChildren();
+        diagDelBtn.style.display = 'none';
+        if (!d) { diagStatus.textContent = '열린 채팅이 없어요. 채팅을 연 뒤 다시 눌러 주세요.'; return; }
+        const short = d.recentCount < s.diagMsgs ? ` · 채팅 메시지가 아직 ${d.recentCount}개뿐이라 판단이 이를 수 있어요` : '';
+        if (!d.rows.length) {
+            diagStatus.textContent = (s.diagScope === 'added'
+                ? '최근 채팅에서 안 나온 "이 확장이 추가한 키워드"가 없어요.'
+                : '최근 채팅에서 안 나온 키워드가 없어요.') + short;
+            return;
+        }
+        diagStatus.textContent = `최근 ${d.recentCount}개 메시지에서 안 나온 키워드 ${d.total}개 (삭제 추천 ${d.recommended}개)${short}`;
+        for (const r of d.rows) {
+            const item = el('div', { class: 'wikt-item' },
+                el('b', { text: r.title }),
+                el('small', { class: r.entryHits ? 'wikt-ok' : 'wikt-src', text: r.entryHits
+                    ? `이 엔트리는 다른 키워드로 ${r.entryHits}회 잡혔어요`
+                    : '엔트리 자체가 아직 안 나왔어요 — 판단 보류' }));
+            for (const it of r.items) {
+                const cb = el('input', { type: 'checkbox', checked: it.recommend });
+                it.cb = cb;
+                item.append(el('label', { class: 'wikt-diagrow' }, cb, ' ', el('span', { text: it.k }),
+                    it.f === 'keysecondary' ? el('small', { class: 'wikt-tag', text: '보조' }) : null,
+                    it.mine ? el('small', { class: 'wikt-tag', text: '확장이 추가' }) : null,
+                    el('small', { class: it.recommend ? 'wikt-bad' : 'wikt-src', text: it.recommend ? ' 삭제 추천' : ' 보류' })));
+            }
+            diagList.append(item);
+        }
+        state.diag = d;
+        diagDelBtn.style.display = '';
+    }
+
+    diagRunBtn.addEventListener('click', async () => {
+        if (state.busy) return;
+        if (!state.data) await loadBook();
+        const d = await diagnose();
+        renderDiag(d);
+        tabBtnD.textContent = d?.recommended ? `진단 (${d.recommended})` : '진단';
+    });
+
+    diagDelBtn.addEventListener('click', async () => {
+        if (state.busy || !state.diag) return;
+        const picked = [];
+        for (const r of state.diag.rows) for (const it of r.items) if (it.cb?.checked) picked.push({ uid: r.uid, f: it.f, k: it.k });
+        if (!picked.length) { toastr.info('체크한 키워드가 없어요.'); return; }
+        const ok = await c.Popup.show.confirm('키워드 삭제', `키워드 ${picked.length}개를 삭제할까요? "마지막 작업 되돌리기"로 다시 넣을 수 있어요.`);
+        if (!ok) return;
+        const data = await c.loadWorldInfo(state.book);
+        if (!data?.entries) { toastr.error('로어북을 불러오지 못했어요.'); return; }
+        const removed = {};
+        let count = 0, kept = 0;
+        const byField = new Map();
+        for (const p of picked) {
+            const key = `${p.uid}\0${p.f}`;
+            if (!byField.has(key)) byField.set(key, { uid: p.uid, f: p.f, words: new Set() });
+            byField.get(key).words.add(p.k);
+        }
+        for (const { uid, f, words } of byField.values()) {
+            const e = data.entries[uid];
+            if (!e || !Array.isArray(e[f])) continue;
+            const next = e[f].filter((k) => !words.has(k));
+            if (f === 'key' && next.length === 0) { kept += words.size; continue; } // never leave an entry without keywords
+            const gone = e[f].filter((k) => words.has(k));
+            if (!gone.length) continue;
+            e[f] = next;
+            syncOriginal(data, uid, f, e[f]);
+            (removed[uid] ??= {})[f] = gone;
+            count += gone.length;
+        }
+        if (kept) toastr.warning(`키워드가 하나도 안 남게 되는 엔트리가 있어서 ${kept}개는 남겨뒀어요.`);
+        if (!count) return;
+        try {
+            await saveBook(state.book, data);
+            await pushUndo({ kind: 'remove', time: Date.now(), book: state.book, removed });
+            state.data = data;
+            toastr.success(`키워드 ${count}개를 삭제했어요.`, state.book);
+            const d = await diagnose();
+            renderDiag(d);
+            tabBtnD.textContent = d?.recommended ? `진단 (${d.recommended})` : '진단';
+            diagStatus.textContent = `삭제 완료! 잘못됐으면 "마지막 작업 되돌리기"를 눌러주세요. — ${diagStatus.textContent}`;
+        } catch (e) {
+            reportError(e, '삭제 실패');
+        }
+    });
+
     // ===== tabs =====
     const tabBtnT = el('div', { class: 'wikt-tabbtn active', text: '번역' });
+    const tabBtnD = el('div', { class: 'wikt-tabbtn', text: '진단', title: '최근 채팅에서 안 나온 키워드 찾기' });
     const tabBtnS = el('div', { class: 'wikt-tabbtn', text: '설정' });
     const showTab = (which) => {
         tabTranslate.style.display = which === 't' ? '' : 'none';
+        tabDiag.style.display = which === 'd' ? '' : 'none';
         tabSettings.style.display = which === 's' ? '' : 'none';
         tabBtnT.classList.toggle('active', which === 't');
+        tabBtnD.classList.toggle('active', which === 'd');
         tabBtnS.classList.toggle('active', which === 's');
         if (which === 's') fillProfiles();
         else updateVisibility();
+        if (which === 'd') diagBookLabel.textContent = state.book;
     };
     tabBtnT.addEventListener('click', () => showTab('t'));
+    tabBtnD.addEventListener('click', () => showTab('d'));
     tabBtnS.addEventListener('click', () => showTab('s'));
 
     const root = el('div', { class: 'wikt-root' },
         el('h3', { text: '월드인포 키워드 번역' }),
-        el('div', { class: 'wikt-tabs' }, tabBtnT, tabBtnS),
+        el('div', { class: 'wikt-tabs' }, tabBtnT, tabBtnD, tabBtnS),
         tabTranslate,
+        tabDiag,
         tabSettings,
     );
 
@@ -617,6 +805,12 @@ async function openTranslator(presetBook) {
         preview.replaceChildren();
         applyBtn.style.display = 'none';
         renderPickList();
+        state.diag = null;
+        diagList.replaceChildren();
+        diagDelBtn.style.display = 'none';
+        diagStatus.textContent = '';
+        diagBookLabel.textContent = state.book;
+        refreshDiagBadge();
     }
     function entriesOf(data) {
         return Object.values(data?.entries || {}).sort((a, b) => (a.displayIndex ?? a.uid) - (b.displayIndex ?? b.uid));
@@ -985,44 +1179,59 @@ async function openTranslator(presetBook) {
         try {
             await saveBook(state.book, data);
             await pushUndo(undo);
+            await updateAdded(state.book, undo.added, true);
             state.data = data;
             toastr.success(`엔트리 ${entries}개에 키워드 ${count}개를 추가했어요.`, state.book);
             state.rows = [];
             renderPreview();
-            status.textContent = '적용 완료! 잘못됐으면 "마지막 적용 되돌리기"를 눌러주세요.';
+            status.textContent = '적용 완료! 잘못됐으면 "마지막 작업 되돌리기"를 눌러주세요.';
+            refreshDiagBadge();
         } catch (e) {
             reportError(e, '저장 실패');
         }
     });
 
-    undoBtn.addEventListener('click', async () => {
+    // Undo the last action: an "add" (translate/chat finder) removes what was added,
+    // a "remove" (diagnose tab) puts the deleted keywords back.
+    async function doUndo() {
         if (state.busy) return;
         const rec = (await loadUndo())[0];
         if (!rec) { toastr.info('되돌릴 기록이 없어요.'); return; }
-        const n = Object.values(rec.added).reduce((a, x) => a + Object.values(x).reduce((b, y) => b + y.length, 0), 0);
+        const isRemove = rec.kind === 'remove';
+        const words = isRemove ? rec.removed : rec.added;
+        const n = Object.values(words).reduce((a, x) => a + Object.values(x).reduce((b, y) => b + y.length, 0), 0);
         const when = new Date(rec.time).toLocaleString();
-        const ok = await c.Popup.show.confirm('되돌리기', `[${rec.book}] ${when}에 추가한 키워드 ${n}개를 지울까요? (그 뒤에 직접 넣은 키워드는 그대로 둬요)`);
+        const ok = await c.Popup.show.confirm('되돌리기', isRemove
+            ? `[${rec.book}] ${when}에 진단 탭에서 삭제한 키워드 ${n}개를 다시 넣을까요?`
+            : `[${rec.book}] ${when}에 추가한 키워드 ${n}개를 지울까요? (그 뒤에 직접 넣은 키워드는 그대로 둬요)`);
         if (!ok) return;
         const data = await c.loadWorldInfo(rec.book);
         if (!data?.entries) { toastr.error(`로어북 "${rec.book}"을 찾지 못했어요.`); await popUndo(); return; }
-        let removed = 0;
-        for (const [uid, fields] of Object.entries(rec.added)) {
+        let changed = 0;
+        for (const [uid, fields] of Object.entries(words)) {
             const e = data.entries[uid];
             if (!e) continue;
-            for (const [f, words] of Object.entries(fields)) {
-                if (!Array.isArray(e[f])) continue;
-                const del = new Set(words);
+            for (const [f, list] of Object.entries(fields)) {
+                if (!Array.isArray(e[f])) e[f] = [];
                 const before = e[f].length;
-                e[f] = e[f].filter((k) => !del.has(k));
-                removed += before - e[f].length;
+                if (isRemove) {
+                    const seen = new Set(e[f].map(norm));
+                    e[f].push(...list.filter((k) => !seen.has(norm(k))));
+                } else {
+                    const del = new Set(list);
+                    e[f] = e[f].filter((k) => !del.has(k));
+                }
+                changed += Math.abs(e[f].length - before);
                 syncOriginal(data, uid, f, e[f]);
             }
         }
         await saveBook(rec.book, data);
         await popUndo();
-        if (rec.book === state.book) { state.data = data; renderPickList(); }
-        toastr.success(`키워드 ${removed}개를 지웠어요.`, rec.book);
-    });
+        if (!isRemove) await updateAdded(rec.book, rec.added, false);
+        if (rec.book === state.book) { state.data = data; renderPickList(); refreshDiagBadge(); }
+        toastr.success(isRemove ? `키워드 ${changed}개를 다시 넣었어요.` : `키워드 ${changed}개를 지웠어요.`, rec.book);
+    }
+    undoBtn.addEventListener('click', doUndo);
 
     await loadBook();
     await c.callGenericPopup(root, c.POPUP_TYPE.TEXT, '', {
