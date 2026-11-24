@@ -878,6 +878,7 @@ async function openTranslator(presetBook) {
     // (e.g. romanized names like Cheongmyeong → 清明 → Qingming) is not a warning.
     function isSuspicious(a) {
         if (a.alt != null) return !cmpOk(a);
+        if (a.orig != null) return false;
         return a.back != null && !backOk(a);
     }
 
@@ -890,12 +891,23 @@ async function openTranslator(presetBook) {
         const anyCheck = adds.some((a) => a.back != null || a.alt != null || a.hits != null || a.lang === 'chat');
         if (!anyCheck) return null;
         const box = el('div', { class: 'wikt-checks' });
-        for (const a of adds) {
+        const refreshWarn = () => box.closest('.wikt-item')?.classList.toggle('has-warn', adds.some(isSuspicious));
+        // swap to an alternative, remembering the first original so it can always be restored
+        const swapTo = (a, chip, to) => {
+            if (a.orig == null) a.orig = a.t;
+            replaceInInput(inp, a.t, to);
+            a.t = to;
+            if (a.t === a.orig) delete a.orig;
+            chip.replaceWith(makeChip(a));
+            refreshWarn();
+        };
+        const makeChip = (a) => {
             const bad = isSuspicious(a);
             const parts = [el('b', { text: a.t }),
                 el('small', { class: 'wikt-src', text: a.lang === 'chat' ? ' ← 채팅 속 표기' : ` ← ${a.src} · ${langLabel(a.lang)}` })];
             if (a.hits != null) parts.push(el('small', { class: a.hits ? 'wikt-ok' : 'wikt-src', text: ` · 채팅 ${a.hits}회` }));
-            if (a.back != null) parts.push(el('small', { class: backOk(a) ? 'wikt-ok' : (bad ? 'wikt-bad' : 'wikt-src'), text: ` · 역번역: ${a.back || '(없음)'}` }));
+            // back-translation belongs to the original text; hide it while a swapped value is shown
+            if (a.back != null && a.orig == null) parts.push(el('small', { class: backOk(a) ? 'wikt-ok' : (bad ? 'wikt-bad' : 'wikt-src'), text: ` · 역번역: ${a.back || '(없음)'}` }));
             let chip;
             if (a.alt != null) {
                 const label = provSel.value === 'ai' ? 'Google' : 'AI';
@@ -903,16 +915,18 @@ async function openTranslator(presetBook) {
                 else {
                     parts.push(el('small', { class: 'wikt-bad', text: ` · ${label}: ${a.alt.join(' / ') || '(없음)'}` }));
                     for (const alt of a.alt.slice(0, 2)) {
-                        parts.push(el('span', {
-                            class: 'menu_button wikt-swap', text: `→ ${alt} 사용`,
-                            onclick: () => { replaceInInput(inp, a.t, alt); a.t = alt; chip.replaceWith(el('div', { class: 'wikt-chip', text: `✔ ${alt} (바꿈)` })); },
-                        }));
+                        parts.push(el('span', { class: 'menu_button wikt-swap', text: `→ ${alt} 사용`, onclick: () => swapTo(a, chip, alt) }));
                     }
                 }
             }
+            if (a.orig != null) {
+                parts.push(el('small', { class: 'wikt-src', text: ` · 원래: ${a.orig}` }));
+                parts.push(el('span', { class: 'menu_button wikt-swap', text: `↩ 원래대로 (${a.orig})`, onclick: () => swapTo(a, chip, a.orig) }));
+            }
             chip = el('div', { class: `wikt-chip ${bad ? 'is-bad' : 'is-ok'}` }, bad ? '⚠️ ' : '✔ ', parts);
-            box.append(chip);
-        }
+            return chip;
+        };
+        for (const a of adds) box.append(makeChip(a));
         return box;
     }
 
