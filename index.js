@@ -1,6 +1,7 @@
 // WI Keyword Translator — adds translated trigger keywords (green-light keys) to World Info entries.
 // Free mode uses SillyTavern's built-in translate endpoints (Google/Bing, 0 LLM tokens).
 // AI mode sends keywords + entry titles (+ optional content snippet, off by default) to the chosen connection.
+// Chat finder (button only, never automatic) sends a recent-chat excerpt + entry titles/keywords to AI.
 
 const MODULE = 'wi_keyword_translator';
 const UNDO_KEY = 'wikt_undo_v1';
@@ -13,7 +14,8 @@ const LANGS = [
     { code: 'ja', label: '일본어', en: 'Japanese' },
     { code: 'ko', label: '한국어', en: 'Korean' },
 ];
-const langLabel = (code) => LANGS.find((l) => l.code === code)?.label ?? code;
+const langLabel = (code) => (code === 'chat' ? '채팅 속 표기' : LANGS.find((l) => l.code === code)?.label ?? code);
+const langEn = (code) => LANGS.find((l) => l.code === code)?.en ?? code;
 
 const PROVIDERS = {
     google: 'Google 번역 (무료 · 토큰 0)',
@@ -31,6 +33,15 @@ const DEFAULT_RULES = [
 
 const AI_SYSTEM = 'You are a precise translation engine for roleplay lorebook keywords. Output only valid JSON.';
 
+// Recommended speed values (safe for free translators and most API rate limits)
+const SPEED_DEFAULTS = Object.freeze({
+    freeBatch: 30,      // keywords per Google/Bing request
+    freeDelay: 500,     // ms between Google/Bing requests
+    aiBatch: 30,        // keywords per AI request
+    aiDelay: 1500,      // ms between AI requests
+    chatEntries: 60,    // entries per chat-finder request
+});
+
 const defaultSettings = Object.freeze({
     langs: ['zh-CN'],
     provider: 'google',
@@ -40,11 +51,21 @@ const defaultSettings = Object.freeze({
     aiRules: '',        // '' = DEFAULT_RULES
     contentChars: 0,    // 0 = don't send entry content
     verifyBack: false,
+    backProvider: 'free', // 'free' (Google/Bing) | 'ai'
     verifyCompare: false,
+    chatMsgs: 30,
+    chatChars: 8000,
+    ...SPEED_DEFAULTS,
     wiButton: true,
 });
 
 const ctx = () => SillyTavern.getContext();
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+function clampInt(v, min, max, def) {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return def;
+    return Math.min(max, Math.max(min, Math.round(n)));
+}
 
 function getSettings() {
     const { extensionSettings } = ctx();
@@ -115,6 +136,31 @@ function cleanResult(s) {
 const splitInput = (s) => String(s ?? '').split(/[,，]/).map((x) => x.trim()).filter(Boolean);
 const entryTitle = (e) => (e.comment || (e.key || [])[0] || `#${e.uid}`).toString();
 
+// ---------- chat text ----------
+function chatMessages() {
+    return (ctx().chat || []).filter((m) => !m.is_system && m.mes).map((m) => String(m.mes));
+}
+/** Latest N messages, trimmed to a char budget (newest kept first). */
+function chatExcerpt() {
+    const s = getSettings();
+    const msgs = chatMessages().slice(-clampInt(s.chatMsgs, 1, 500, 30));
+    let budget = clampInt(s.chatChars, 500, 100000, 8000);
+    const out = [];
+    for (let i = msgs.length - 1; i >= 0 && budget > 0; i--) {
+        const m = msgs[i].length > budget ? msgs[i].slice(-budget) : msgs[i];
+        out.unshift(m);
+        budget -= m.length;
+    }
+    return out.join('\n\n');
+}
+function countHits(hayLower, needle) {
+    const n = norm(needle);
+    if (!n || !hayLower) return 0;
+    let c = 0, i = 0;
+    while ((i = hayLower.indexOf(n, i)) !== -1) { c++; i += n.length; }
+    return c;
+}
+
 // ---------- free translation (Google / Bing via ST server) ----------
 async function freeTranslateOne(provider, text, lang) {
     const res = await fetch(`/api/translate/${provider}`, {
@@ -122,36 +168,54 @@ async function freeTranslateOne(provider, text, lang) {
         headers: ctx().getRequestHeaders(),
         body: JSON.stringify({ text, lang }),
     });
-    if (!res.ok) throw new Error(`${provider} 번역 실패 (HTTP ${res.status})`);
+    if (!res.ok) throw new Error(`${provider === 'bing' ? 'Bing' : 'Google'} 번역 실패 (HTTP ${res.status}) — 너무 빨리 보냈을 수 있어요. 설정 탭에서 딜레이를 늘려 보세요.`);
     return await res.text();
 }
 
-/** Translates many short texts with few requests: newline-joined batches, per-item fallback. Returns Map(text → [result]). */
-async function freeTranslate(provider, texts, lang, progress, isCancelled) {
-    const out = new Map();
+/**
+ * Translates many short texts with few requests: newline-joined batches, per-item fallback only when
+ * the line count doesn't match. Waits between requests; on an error waits longer and retries once,
+ * then gives up (no hammering). Writes into `out` (Map text → [result]) so partial results survive.
+ */
+async function freeTranslate(provider, texts, lang, progress, isCancelled, out = new Map()) {
+    const s = getSettings();
+    const batch = clampInt(s.freeBatch, 1, 50, SPEED_DEFAULTS.freeBatch);
+    const delay = clampInt(s.freeDelay, 0, 30000, SPEED_DEFAULTS.freeDelay);
     const chunks = [];
     let cur = [], len = 0;
     for (const t of texts) {
-        if (cur.length && (len + t.length > 800 || cur.length >= 30)) { chunks.push(cur); cur = []; len = 0; }
+        if (cur.length && (len + t.length > 1500 || cur.length >= batch)) { chunks.push(cur); cur = []; len = 0; }
         cur.push(t); len += t.length + 1;
     }
     if (cur.length) chunks.push(cur);
 
+    let first = true;
+    const call = async (text) => {
+        if (!first) await sleep(delay);
+        first = false;
+        try {
+            return await freeTranslateOne(provider, text, lang);
+        } catch (e) {
+            console.warn('[WIKT] request failed, retrying once', e);
+            await sleep(Math.max(3000, delay * 4));
+            if (isCancelled()) throw e;
+            return await freeTranslateOne(provider, text, lang);
+        }
+    };
+
     for (const chunk of chunks) {
         if (isCancelled()) break;
-        let lines = null;
-        try {
-            const joined = await freeTranslateOne(provider, chunk.join('\n'), lang);
-            lines = joined.split(/\r?\n/).filter((l) => l.trim() !== '');
-        } catch (e) {
-            console.warn('[WIKT] batch failed, falling back', e);
-        }
-        if (lines && lines.length === chunk.length) {
-            chunk.forEach((t, i) => out.set(t, [lines[i]]));
+        if (chunk.length === 1) {
+            out.set(chunk[0], [await call(chunk[0])]);
         } else {
-            for (const t of chunk) {
-                if (isCancelled()) break;
-                try { out.set(t, [await freeTranslateOne(provider, t, lang)]); } catch (e) { console.warn('[WIKT]', e); }
+            const lines = (await call(chunk.join('\n'))).split(/\r?\n/).filter((l) => l.trim() !== '');
+            if (lines.length === chunk.length) {
+                chunk.forEach((t, i) => out.set(t, [lines[i]]));
+            } else {
+                for (const t of chunk) {
+                    if (isCancelled()) break;
+                    out.set(t, [await call(t)]);
+                }
             }
         }
         progress(chunk.length);
@@ -159,19 +223,22 @@ async function freeTranslate(provider, texts, lang, progress, isCancelled) {
     return out;
 }
 
-/** need: Map(lang → Map(text → entry)) → Map(`${lang}\0${text}` → string[]) */
-async function freeTranslateNeed(provider, need, progress, isCancelled) {
-    const results = new Map();
+/** need: Map(lang → Map(text → entry)); fills out: Map(`${lang}\0${text}` → string[]) */
+async function freeTranslateNeed(provider, need, progress, isCancelled, out = new Map()) {
     for (const [l, m] of need) {
         const texts = [...m.keys()];
         if (!texts.length || isCancelled()) continue;
-        const r = await freeTranslate(provider, texts, l, progress, isCancelled);
-        for (const [t, v] of r) results.set(`${l}\0${t}`, v);
+        const part = new Map();
+        try {
+            await freeTranslate(provider, texts, l, progress, isCancelled, part);
+        } finally {
+            for (const [t, v] of part) out.set(`${l}\0${t}`, v);
+        }
     }
-    return results;
+    return out;
 }
 
-// ---------- AI translation ----------
+// ---------- AI ----------
 function getProfiles() {
     try {
         return ctx().ConnectionManagerRequestService?.getSupportedProfiles?.() ?? [];
@@ -181,21 +248,21 @@ function getProfiles() {
 }
 
 /** Sends one request to the chosen connection profile, or the current connection when none is set. */
-async function callAI(userPrompt, maxTokens) {
+async function callAI(userPrompt, maxTokens, system = AI_SYSTEM) {
     const s = getSettings();
     const c = ctx();
     if (s.aiProfile) {
         const profile = getProfiles().find((p) => p.id === s.aiProfile);
-        if (!profile) throw new Error('선택한 연결 프로필을 찾지 못했어요. 프로필을 다시 골라 주세요.');
+        if (!profile) throw new Error('선택한 연결 프로필을 찾지 못했어요. 설정 탭에서 프로필을 다시 골라 주세요.');
         const res = await c.ConnectionManagerRequestService.sendRequest(
             s.aiProfile,
-            [{ role: 'system', content: AI_SYSTEM }, { role: 'user', content: userPrompt }],
+            [{ role: 'system', content: system }, { role: 'user', content: userPrompt }],
             maxTokens,
             { stream: false, extractData: true, includePreset: true, includeInstruct: true },
         );
         return typeof res === 'string' ? res : String(res?.content ?? '');
     }
-    return String(await c.generateRaw({ prompt: userPrompt, systemPrompt: AI_SYSTEM, responseLength: maxTokens }) ?? '');
+    return String(await c.generateRaw({ prompt: userPrompt, systemPrompt: system, responseLength: maxTokens }) ?? '');
 }
 
 function parseJsonLoose(s) {
@@ -204,8 +271,17 @@ function parseJsonLoose(s) {
     return JSON.parse(s.slice(a, b + 1));
 }
 
+async function callAIJson(prompt, maxTokens, system) {
+    const raw = await callAI(prompt, maxTokens, system);
+    try { return parseJsonLoose(raw); } catch (e) {
+        console.warn('[WIKT] AI raw output:', raw);
+        throw e;
+    }
+}
+
 /** Groups need-map keywords by entry and splits them into request-sized chunks. */
 function buildAIChunks(need) {
+    const limit = clampInt(getSettings().aiBatch, 5, 100, SPEED_DEFAULTS.aiBatch);
     const byText = new Map(); // text → entry (first one wins)
     for (const m of need.values()) for (const [t, e] of m) if (!byText.has(t)) byText.set(t, e);
     const groups = new Map(); // uid → {entry, texts}
@@ -216,8 +292,12 @@ function buildAIChunks(need) {
     const chunks = [];
     let cur = [], n = 0;
     for (const g of groups.values()) {
-        if (cur.length && n + g.texts.length > 40) { chunks.push(cur); cur = []; n = 0; }
-        cur.push(g); n += g.texts.length;
+        // keep an entry's keywords together, but never let one huge entry blow past the limit
+        for (let i = 0; i < g.texts.length; i += limit) {
+            const piece = { entry: g.entry, texts: g.texts.slice(i, i + limit) };
+            if (cur.length && n + piece.texts.length > limit) { chunks.push(cur); cur = []; n = 0; }
+            cur.push(piece); n += piece.texts.length;
+        }
     }
     if (cur.length) chunks.push(cur);
     return chunks;
@@ -225,7 +305,7 @@ function buildAIChunks(need) {
 
 function buildAIPrompt(groups, langs) {
     const s = getSettings();
-    const langDesc = langs.map((l) => `"${l}" (${LANGS.find((x) => x.code === l)?.en})`).join(', ');
+    const langDesc = langs.map((l) => `"${l}" (${langEn(l)})`).join(', ');
     const lines = [];
     const order = [];
     for (const g of groups) {
@@ -247,19 +327,16 @@ function buildAIPrompt(groups, langs) {
     return { prompt, order };
 }
 
-/** need: Map(lang → Map(text → entry)) → Map(`${lang}\0${text}` → string[]) */
-async function aiTranslateNeed(need, progress, isCancelled) {
-    const out = new Map();
+/** need: Map(lang → Map(text → entry)); fills out: Map(`${lang}\0${text}` → string[]) */
+async function aiTranslateNeed(need, progress, isCancelled, out = new Map()) {
+    const delay = clampInt(getSettings().aiDelay, 0, 60000, SPEED_DEFAULTS.aiDelay);
     const langs = [...need.keys()].filter((l) => need.get(l).size);
-    for (const groups of buildAIChunks(need)) {
+    const chunks = buildAIChunks(need);
+    for (let i = 0; i < chunks.length; i++) {
         if (isCancelled()) break;
-        const { prompt, order } = buildAIPrompt(groups, langs);
-        const raw = await callAI(prompt, Math.min(8000, 400 + order.length * langs.length * 40));
-        let json;
-        try { json = parseJsonLoose(raw); } catch (e) {
-            console.warn('[WIKT] AI raw output:', raw);
-            throw e;
-        }
+        if (i > 0) await sleep(delay);
+        const { prompt, order } = buildAIPrompt(chunks[i], langs);
+        const json = await callAIJson(prompt, Math.min(8000, 400 + order.length * langs.length * 40));
         order.forEach((t, j) => {
             const row = json[String(j + 1)];
             if (!row || typeof row !== 'object') return;
@@ -274,10 +351,53 @@ async function aiTranslateNeed(need, progress, isCancelled) {
     return out;
 }
 
-/** Rough size of what AI mode will send, for the confirmation dialog. */
-function estimateAIChars(need) {
-    const langs = [...need.keys()].filter((l) => need.get(l).size);
-    return buildAIChunks(need).reduce((a, g) => a + AI_SYSTEM.length + buildAIPrompt(g, langs).prompt.length, 0);
+/** Plain list translation by AI (used for back-translation). Returns Map(text → result). */
+async function aiTranslateList(texts, lang, progress, isCancelled, out = new Map()) {
+    const s = getSettings();
+    const limit = clampInt(s.aiBatch, 5, 100, SPEED_DEFAULTS.aiBatch);
+    const delay = clampInt(s.aiDelay, 0, 60000, SPEED_DEFAULTS.aiDelay);
+    for (let i = 0; i < texts.length; i += limit) {
+        if (isCancelled()) break;
+        if (i > 0) await sleep(delay);
+        const part = texts.slice(i, i + limit);
+        const prompt = [
+            `Translate each item literally into ${langEn(lang)} ("${lang}"). This is a back-translation check: give the plain meaning/reading a native speaker would understand, do not guess what the original was.`,
+            s.aiHint ? `세계관 메모: ${s.aiHint}` : '',
+            'Return ONLY a JSON object like {"1": "...", "2": "..."}.',
+            '',
+            ...part.map((t, j) => `${j + 1}. ${t}`),
+        ].filter((x) => x !== '').join('\n');
+        const json = await callAIJson(prompt, Math.min(4000, 200 + part.length * 30));
+        part.forEach((t, j) => {
+            const v = json[String(j + 1)];
+            if (v != null) out.set(t, String(Array.isArray(v) ? v[0] : v));
+        });
+        progress(part.length);
+    }
+    return out;
+}
+
+// ---------- chat finder ----------
+function buildChatPrompt(entries, excerpt) {
+    const s = getSettings();
+    const list = entries.map((e, i) => `E${i + 1}. ${entryTitle(e).slice(0, 60)} — keywords: ${(e.key || []).filter((k) => !isRegexKey(k)).join(', ')}`).join('\n');
+    return [
+        'Below is an excerpt of a roleplay and a list of lorebook entries.',
+        'For each entry, list the exact strings that appear in the excerpt and refer to that entry (names, nicknames, titles, alternate spellings, or the same name in another language) but are NOT already among its keywords.',
+        '- Copy each string exactly as written in the excerpt (same characters/script). Do not translate or invent.',
+        '- Only clear references to that specific entry; skip generic words and pronouns.',
+        '- Omit entries with nothing new.',
+        s.aiHint ? `세계관 메모: ${s.aiHint}` : '',
+        'Return ONLY a JSON object like {"E1": ["..."], "E4": ["..."]}.',
+        '',
+        'Entries:',
+        list,
+        '',
+        'Excerpt:',
+        '"""',
+        excerpt,
+        '"""',
+    ].filter((x) => x !== '').join('\n');
 }
 
 // ---------- undo storage (only remembers which keywords were added) ----------
@@ -315,9 +435,10 @@ async function openTranslator(presetBook) {
     const books = c.getWorldInfoNames();
     if (!books.length) { toastr.info('월드인포(로어북)가 하나도 없어요.'); return; }
 
-    const state = { book: books.includes(presetBook) ? presetBook : books[0], data: null, scope: 'all', picked: new Set(), rows: [], busy: false, cancel: false };
+    const state = { book: books.includes(presetBook) ? presetBook : books[0], data: null, scope: 'all', picked: new Set(), rows: [], busy: false, cancel: false, mode: 'translate' };
+    const isCancelled = () => state.cancel;
 
-    // --- basic controls ---
+    // ===== translate tab controls =====
     const bookSel = el('select', { class: 'text_pole' }, books.map((b) => el('option', { value: b, text: b })));
     bookSel.value = state.book;
 
@@ -345,63 +466,46 @@ async function openTranslator(presetBook) {
     const secCb = el('input', { type: 'checkbox', checked: s.includeSecondary });
     secCb.addEventListener('change', () => { s.includeSecondary = secCb.checked; save(); });
 
-    // --- AI settings ---
-    const profiles = getProfiles();
-    const profSel = el('select', { class: 'text_pole' },
-        el('option', { value: '', text: '현재 연결 (지금 채팅에 쓰는 API)' }),
-        profiles.map((p) => el('option', { value: p.id, text: `프로필: ${p.name}` })));
-    profSel.value = profiles.some((p) => p.id === s.aiProfile) ? s.aiProfile : '';
-    profSel.addEventListener('change', () => { s.aiProfile = profSel.value; save(); });
+    const backCb = el('input', { type: 'checkbox', checked: s.verifyBack });
+    backCb.addEventListener('change', () => { s.verifyBack = backCb.checked; save(); updateVisibility(); });
+    const backSel = el('select', { class: 'text_pole wikt-inline-select' },
+        el('option', { value: 'free', text: '무료 번역기로 (토큰 0)' }),
+        el('option', { value: 'ai', text: 'AI로 (토큰 소모)' }));
+    backSel.value = s.backProvider;
+    backSel.addEventListener('change', () => { s.backProvider = backSel.value; save(); updateVisibility(); });
+
+    const cmpCb = el('input', { type: 'checkbox', checked: s.verifyCompare });
+    const cmpLabelText = el('span', {});
 
     const hintArea = el('textarea', { class: 'text_pole', rows: 2, placeholder: '예: 한국 무협 세계관(화산귀환풍). 인물·문파 이름은 한자 표기로.', value: s.aiHint });
     hintArea.addEventListener('input', () => { s.aiHint = hintArea.value; save(); });
-
-    const contentNum = el('input', { class: 'text_pole wikt-num', type: 'number', min: 0, max: 2000, step: 50, value: s.contentChars });
-    contentNum.addEventListener('input', () => { s.contentChars = Math.max(0, Math.min(2000, Number(contentNum.value) || 0)); save(); });
-
-    const rulesArea = el('textarea', { class: 'text_pole wikt-rules', rows: 6, value: s.aiRules || DEFAULT_RULES });
-    rulesArea.addEventListener('input', () => { s.aiRules = rulesArea.value.trim() === DEFAULT_RULES ? '' : rulesArea.value; save(); });
-    const rulesReset = el('div', { class: 'menu_button', text: '기본값 복원', onclick: () => { rulesArea.value = DEFAULT_RULES; s.aiRules = ''; save(); } });
-
-    const aiBox = el('div', { class: 'wikt-aibox' },
-        el('div', { class: 'wikt-row' }, el('b', { text: 'AI 연결' }), profSel),
-        profiles.length ? null : el('small', { class: 'wikt-note', text: '저장된 연결 프로필이 없어서 현재 연결만 쓸 수 있어요. (API 연결 화면의 Connection Profile에서 저장 가능)' }),
-        el('small', { text: '세계관 메모 (선택)' }), hintArea,
-        el('div', { class: 'wikt-row' },
-            el('small', { text: '엔트리 본문 앞부분 함께 보내기 (글자 수, 0 = 안 보냄)' }), contentNum),
-        el('small', { class: 'wikt-note', text: '본문을 보내면 고유명사 정확도가 올라가지만 토큰이 늘어요. 본문은 AI 연결로만 가고 구글/빙으로는 절대 안 가요.' }),
-        el('details', {},
-            el('summary', { text: '번역 프롬프트 보기/수정' }),
-            rulesArea,
-            el('div', { class: 'wikt-row' }, rulesReset,
-                el('small', { class: 'wikt-note', text: '대상 언어, 세계관 메모, JSON 응답 형식, 키워드 목록은 자동으로 붙어요.' }))));
-
-    // --- verification ---
-    const backCb = el('input', { type: 'checkbox', checked: s.verifyBack });
-    backCb.addEventListener('change', () => { s.verifyBack = backCb.checked; save(); });
-    const cmpCb = el('input', { type: 'checkbox', checked: s.verifyCompare });
-    const cmpLabelText = el('span', {});
-    const updateVisibility = () => {
-        const otherIsAI = provSel.value !== 'ai';
-        cmpLabelText.textContent = otherIsAI
-            ? ' 교차 비교: AI 번역과 비교해서 다른 것만 ⚠️ (AI 토큰 소모)'
-            : ' 교차 비교: Google 번역과 비교해서 다른 것만 ⚠️ (무료)';
-        aiBox.style.display = (provSel.value === 'ai' || (cmpCb.checked && otherIsAI)) ? '' : 'none';
-    };
-    cmpCb.addEventListener('change', () => { s.verifyCompare = cmpCb.checked; save(); updateVisibility(); });
-    provSel.addEventListener('change', () => { s.provider = provSel.value; save(); updateVisibility(); });
-    updateVisibility();
+    const hintBox = el('div', { class: 'wikt-hint' }, el('small', { text: 'AI에게 줄 세계관 메모 (선택)' }), hintArea);
+    const aiInfo = el('small', { class: 'wikt-note' });
 
     const status = el('div', { class: 'wikt-status' });
     const runBtn = el('div', { class: 'menu_button menu_button_icon' }, el('i', { class: 'fa-solid fa-magnifying-glass' }), el('span', { text: '스캔 & 번역' }));
+    const chatBtn = el('div', { class: 'menu_button menu_button_icon', title: '현재 채팅에 실제로 나온 표기를 AI로 찾아서 키워드 후보로 보여줘요' }, el('i', { class: 'fa-solid fa-comments' }), el('span', { text: '채팅에서 실제 표기 찾기 (AI)' }));
     const stopBtn = el('div', { class: 'menu_button', text: '중지', style: 'display:none' });
     const undoBtn = el('div', { class: 'menu_button menu_button_icon', title: '마지막으로 적용한 키워드 추가를 취소해요' }, el('i', { class: 'fa-solid fa-rotate-left' }), el('span', { text: '마지막 적용 되돌리기' }));
 
     const preview = el('div', { class: 'wikt-preview' });
     const applyBtn = el('div', { class: 'menu_button menu_button_icon wikt-apply', style: 'display:none' }, el('i', { class: 'fa-solid fa-check' }), el('span', { text: '체크한 항목 적용' }));
 
-    const root = el('div', { class: 'wikt-root' },
-        el('h3', { text: '월드인포 키워드 번역' }),
+    function updateVisibility() {
+        const otherIsAI = provSel.value !== 'ai';
+        cmpLabelText.textContent = otherIsAI
+            ? ' 교차 비교: AI 번역과 비교해서 다른 것만 ⚠️ (AI 토큰 소모)'
+            : ' 교차 비교: Google 번역과 비교해서 다른 것만 ⚠️ (무료)';
+        backSel.style.display = backCb.checked ? '' : 'none';
+        const usesAI = provSel.value === 'ai' || (cmpCb.checked && otherIsAI) || (backCb.checked && backSel.value === 'ai');
+        hintBox.style.display = usesAI ? '' : 'none';
+        const prof = getProfiles().find((p) => p.id === s.aiProfile);
+        aiInfo.textContent = usesAI ? `AI 연결: ${prof ? `프로필 "${prof.name}"` : '현재 연결'} · 바꾸려면 설정 탭` : '';
+    }
+    cmpCb.addEventListener('change', () => { s.verifyCompare = cmpCb.checked; save(); updateVisibility(); });
+    provSel.addEventListener('change', () => { s.provider = provSel.value; save(); updateVisibility(); });
+
+    const tabTranslate = el('div', { class: 'wikt-tab' },
         el('div', { class: 'wikt-row' }, el('b', { text: '로어북' }), bookSel),
         el('div', { class: 'wikt-row' }, el('b', { text: '범위' }),
             el('label', {}, scopeAll, ' 전체 엔트리'),
@@ -412,14 +516,97 @@ async function openTranslator(presetBook) {
         el('div', { class: 'wikt-row' }, el('b', { text: '번역 방식' }), provSel),
         el('div', { class: 'wikt-row' }, el('label', {}, secCb, ' 보조 키워드(Optional Filter)도 번역')),
         el('div', { class: 'wikt-row' }, el('b', { text: '검증' }),
-            el('label', {}, backCb, ' 역번역 표시 (무료)'),
-            el('label', {}, cmpCb, cmpLabelText)),
-        aiBox,
+            el('label', {}, backCb, ' 역번역 표시'), backSel),
+        el('div', { class: 'wikt-row' }, el('b', { text: '' }), el('label', {}, cmpCb, cmpLabelText)),
+        hintBox,
+        aiInfo,
         el('small', { class: 'wikt-note', text: '항상 켜짐(파란불) 엔트리와 정규식(/.../) 키워드는 건너뛰어요.' }),
-        el('div', { class: 'wikt-row' }, runBtn, stopBtn, undoBtn),
+        el('div', { class: 'wikt-row' }, runBtn, chatBtn, stopBtn, undoBtn),
         status,
         preview,
         applyBtn,
+    );
+
+    // ===== settings tab controls =====
+    const numInputs = {};
+    function numField(label, key, min, max, step, help) {
+        const inp = el('input', { class: 'text_pole wikt-num', type: 'number', min, max, step, value: s[key] });
+        inp.addEventListener('input', () => { s[key] = clampInt(inp.value, min, max, defaultSettings[key]); save(); });
+        inp.addEventListener('change', () => { inp.value = s[key]; });
+        numInputs[key] = inp;
+        return el('div', { class: 'wikt-setrow' }, el('span', { class: 'wikt-setlabel', text: label }), inp,
+            help ? el('small', { class: 'wikt-note', text: help }) : null);
+    }
+
+    const profSel = el('select', { class: 'text_pole' });
+    function fillProfiles() {
+        const profiles = getProfiles();
+        profSel.replaceChildren(
+            el('option', { value: '', text: '현재 연결 (지금 채팅에 쓰는 API)' }),
+            ...profiles.map((p) => el('option', { value: p.id, text: `프로필: ${p.name}` })));
+        profSel.value = profiles.some((p) => p.id === s.aiProfile) ? s.aiProfile : '';
+        profNote.style.display = profiles.length ? 'none' : '';
+    }
+    const profNote = el('small', { class: 'wikt-note', text: '저장된 연결 프로필이 없어서 현재 연결만 쓸 수 있어요. (API 연결 화면의 Connection Profile에서 저장 가능)' });
+    profSel.addEventListener('change', () => { s.aiProfile = profSel.value; save(); updateVisibility(); });
+
+    const rulesArea = el('textarea', { class: 'text_pole wikt-rules', rows: 6, value: s.aiRules || DEFAULT_RULES });
+    rulesArea.addEventListener('input', () => { s.aiRules = rulesArea.value.trim() === DEFAULT_RULES ? '' : rulesArea.value; save(); });
+
+    const wiCb = el('input', { type: 'checkbox', checked: s.wiButton });
+    wiCb.addEventListener('change', () => { s.wiButton = wiCb.checked; save(); syncWIButton(); });
+
+    const tabSettings = el('div', { class: 'wikt-tab', style: 'display:none' },
+        el('h4', { text: 'AI 연결' }),
+        el('div', { class: 'wikt-row' }, profSel),
+        profNote,
+        el('h4', { text: 'AI에 보내는 내용' }),
+        numField('엔트리 본문 앞부분 (글자 수)', 'contentChars', 0, 2000, 50, '0 = 안 보냄(기본). 켜면 고유명사 정확도↑ 토큰↑. 본문은 AI로만 가고 구글/빙으로는 절대 안 가요.'),
+        el('details', {},
+            el('summary', { text: '번역 프롬프트 보기/수정' }),
+            rulesArea,
+            el('div', { class: 'wikt-row' },
+                el('div', { class: 'menu_button', text: '기본값 복원', onclick: () => { rulesArea.value = DEFAULT_RULES; s.aiRules = ''; save(); } }),
+                el('small', { class: 'wikt-note', text: '대상 언어, 세계관 메모, JSON 응답 형식, 키워드 목록은 자동으로 붙어요.' }))),
+        el('h4', { text: '속도 · 묶음 (과부하/차단 방지)' }),
+        numField('무료 번역: 한 번에 보내는 키워드 수', 'freeBatch', 1, 50, 1, `추천 ${SPEED_DEFAULTS.freeBatch}`),
+        numField('무료 번역: 요청 사이 대기 (ms)', 'freeDelay', 0, 30000, 100, `추천 ${SPEED_DEFAULTS.freeDelay} · 1000ms = 1초`),
+        numField('AI: 한 번에 보내는 키워드 수', 'aiBatch', 5, 100, 1, `추천 ${SPEED_DEFAULTS.aiBatch} · 크면 요청 수↓ 대신 응답이 잘리거나 형식이 깨질 수 있어요`),
+        numField('AI: 요청 사이 대기 (ms)', 'aiDelay', 0, 60000, 100, `추천 ${SPEED_DEFAULTS.aiDelay}`),
+        numField('채팅에서 찾기: 한 번에 보내는 엔트리 수', 'chatEntries', 5, 200, 5, `추천 ${SPEED_DEFAULTS.chatEntries} · 요청마다 채팅 발췌가 같이 가요`),
+        el('div', { class: 'wikt-row' }, el('div', {
+            class: 'menu_button', text: '속도 설정 추천값으로 복원',
+            onclick: () => { for (const [k, v] of Object.entries(SPEED_DEFAULTS)) { s[k] = v; numInputs[k].value = v; } save(); toastr.info('추천값으로 되돌렸어요.'); },
+        })),
+        el('small', { class: 'wikt-note', text: '실패하면 잠깐(3초 이상) 쉬고 한 번만 다시 시도해요. 그래도 안 되면 거기서 멈추고, 그때까지 번역된 것만 보여줘요.' }),
+        el('h4', { text: '채팅에서 실제 표기 찾기' }),
+        numField('최근 메시지 수', 'chatMsgs', 1, 500, 5, '추천 30'),
+        numField('최대 글자 수', 'chatChars', 500, 100000, 500, '추천 8000 · 넘으면 최신 메시지부터 잘라서 보내요'),
+        el('h4', { text: '기타' }),
+        el('label', { class: 'checkbox_label' }, wiCb, el('span', { text: '월드인포 편집창에 번역 버튼 표시' })),
+    );
+    fillProfiles();
+    updateVisibility();
+
+    // ===== tabs =====
+    const tabBtnT = el('div', { class: 'wikt-tabbtn active', text: '번역' });
+    const tabBtnS = el('div', { class: 'wikt-tabbtn', text: '설정' });
+    const showTab = (which) => {
+        tabTranslate.style.display = which === 't' ? '' : 'none';
+        tabSettings.style.display = which === 's' ? '' : 'none';
+        tabBtnT.classList.toggle('active', which === 't');
+        tabBtnS.classList.toggle('active', which === 's');
+        if (which === 's') fillProfiles();
+        else updateVisibility();
+    };
+    tabBtnT.addEventListener('click', () => showTab('t'));
+    tabBtnS.addEventListener('click', () => showTab('s'));
+
+    const root = el('div', { class: 'wikt-root' },
+        el('h3', { text: '월드인포 키워드 번역' }),
+        el('div', { class: 'wikt-tabs' }, tabBtnT, tabBtnS),
+        tabTranslate,
+        tabSettings,
     );
 
     // --- entry picking ---
@@ -464,29 +651,46 @@ async function openTranslator(presetBook) {
     filterInput.addEventListener('input', renderPickList);
     bookSel.addEventListener('change', async () => { state.book = bookSel.value; await loadBook(); });
 
-    // --- scan & translate ---
+    // --- shared run helpers ---
     function setBusy(b) {
         state.busy = b;
         runBtn.classList.toggle('disabled', b);
+        chatBtn.classList.toggle('disabled', b);
         applyBtn.classList.toggle('disabled', b);
         stopBtn.style.display = b ? '' : 'none';
     }
-    stopBtn.addEventListener('click', () => { state.cancel = true; status.textContent = '중지하는 중…'; });
+    stopBtn.addEventListener('click', () => { state.cancel = true; status.textContent = '중지하는 중… (지금 보내는 요청이 끝나면 멈춰요)'; });
 
     function phase(label, total) {
         let done = 0;
         status.textContent = `${label}… 0 / ${total}`;
         return (n) => { done += n; status.textContent = `${label}… ${Math.min(done, total)} / ${total}`; };
     }
+    const reportError = (e, title) => {
+        console.error('[WIKT]', e);
+        toastr.error(String(e?.message || e) + (e?.cause ? ` (${e.cause.message || e.cause})` : ''), title);
+    };
+    function targetEntries() {
+        return entriesOf(state.data).filter((e) =>
+            !e.constant && (e.key || []).length && (state.scope === 'all' || state.picked.has(String(e.uid))));
+    }
+    /** Pause between phases too, so a new phase's first request doesn't follow the last one instantly. */
+    const gap = (kind) => sleep(kind === 'ai'
+        ? clampInt(s.aiDelay, 0, 60000, SPEED_DEFAULTS.aiDelay)
+        : clampInt(s.freeDelay, 0, 30000, SPEED_DEFAULTS.freeDelay));
+    const profileName = () => {
+        const p = getProfiles().find((x) => x.id === s.aiProfile);
+        return p ? `프로필 "${p.name}"` : '현재 연결';
+    };
 
+    // --- scan & translate ---
     runBtn.addEventListener('click', async () => {
         if (state.busy) return;
         const langs = langBoxes.filter((x) => x.checked).map((x) => x.value);
         if (!langs.length) { toastr.warning('추가할 언어를 하나 이상 골라주세요.'); return; }
         if (!state.data) await loadBook();
         const fields = s.includeSecondary ? ['key', 'keysecondary'] : ['key'];
-        const targets = entriesOf(state.data).filter((e) =>
-            !e.constant && (e.key || []).length && (state.scope === 'all' || state.picked.has(String(e.uid))));
+        const targets = targetEntries();
         if (!targets.length) { toastr.info('번역할 엔트리가 없어요. (범위/선택을 확인해 주세요)'); return; }
 
         // unique (lang, keyword) jobs → first entry that uses it (for AI context)
@@ -505,33 +709,40 @@ async function openTranslator(presetBook) {
 
         const provider = provSel.value;
         const freeProv = provider === 'ai' ? 'google' : provider;
-        const useAI = provider === 'ai' || s.verifyCompare;
-        if (useAI) {
+        const aiMain = provider === 'ai';
+        const aiCompare = s.verifyCompare && !aiMain;
+        const aiBack = s.verifyBack && s.backProvider === 'ai';
+        if (aiMain || aiCompare || aiBack) {
             const uniq = new Set([...need.values()].flatMap((m) => [...m.keys()]));
-            const chars = estimateAIChars(need);
-            const who = s.aiProfile ? `프로필 "${profiles.find((p) => p.id === s.aiProfile)?.name ?? '?'}"` : '현재 연결';
+            const langsUsed = [...need.keys()].filter((l) => need.get(l).size);
+            const chunks = buildAIChunks(need);
+            const chars = chunks.reduce((a, g) => a + AI_SYSTEM.length + buildAIPrompt(g, langsUsed).prompt.length, 0);
+            const uses = [aiMain ? '번역' : null, aiCompare ? '교차 비교' : null, aiBack ? '역번역' : null].filter(Boolean).join(' + ');
             const what = s.contentChars > 0 ? `키워드 ${uniq.size}개 + 엔트리 제목 + 본문 앞 ${s.contentChars}자` : `키워드 ${uniq.size}개 + 엔트리 제목 (본문 X)`;
-            const ok = await c.Popup.show.confirm('AI 번역', `${who}로 ${what}를 보내요. 보내는 양은 약 ${chars.toLocaleString()}자예요. 진행할까요?`);
+            const msg = `${profileName()}로 AI ${uses}을 해요.\n번역 단계: ${what}, 요청 ${chunks.length}번 · 약 ${chars.toLocaleString()}자` +
+                (aiBack ? '\n역번역 단계: 번역 결과 개수만큼 추가 요청' : '') + '\n진행할까요?';
+            const ok = await c.Popup.show.confirm('AI 사용 확인', msg);
             if (!ok) return;
         }
 
         setBusy(true);
         state.cancel = false;
-        const isCancelled = () => state.cancel;
-        let results = new Map(), other = null, back = new Map();
+        state.mode = 'translate';
+        const results = new Map();
+        let other = null;
+        const back = new Map();
         try {
-            results = provider === 'ai'
-                ? await aiTranslateNeed(need, phase('AI 번역 중', total), isCancelled)
-                : await freeTranslateNeed(provider, need, phase('번역 중', total), isCancelled);
+            if (aiMain) await aiTranslateNeed(need, phase('AI 번역 중', total), isCancelled, results);
+            else await freeTranslateNeed(provider, need, phase('번역 중', total), isCancelled, results);
 
             if (s.verifyCompare && !state.cancel) {
-                other = provider === 'ai'
-                    ? await freeTranslateNeed('google', need, phase('비교용 Google 번역 중', total), isCancelled)
-                    : await aiTranslateNeed(need, phase('비교용 AI 번역 중', total), isCancelled);
+                await gap(aiMain ? 'free' : 'ai');
+                other = new Map();
+                if (aiMain) await freeTranslateNeed('google', need, phase('비교용 Google 번역 중', total), isCancelled, other);
+                else await aiTranslateNeed(need, phase('비교용 AI 번역 중', total), isCancelled, other);
             }
         } catch (e) {
-            console.error('[WIKT]', e);
-            toastr.error(String(e?.message || e) + (e?.cause ? ` (${e.cause.message || e.cause})` : ''), '번역 실패');
+            reportError(e, '번역 중단');
         }
 
         // build proposals
@@ -558,7 +769,7 @@ async function openTranslator(presetBook) {
             if (Object.keys(row.adds).length) state.rows.push(row);
         }
 
-        // back-translation (free) of every proposed keyword into its source keyword's language
+        // back-translation of every proposed keyword into its source keyword's language
         if (s.verifyBack && !state.cancel && state.rows.length) {
             const byLang = new Map();
             for (const r of state.rows) for (const adds of Object.values(r.adds)) for (const a of adds) {
@@ -567,26 +778,99 @@ async function openTranslator(presetBook) {
                 byLang.get(bl).add(a.t);
             }
             const n = [...byLang.values()].reduce((x, set) => x + set.size, 0);
-            const prog = phase('역번역 중', n);
+            const prog = phase(aiBack ? 'AI 역번역 중' : '역번역 중', n);
             try {
                 for (const [bl, set] of byLang) {
                     if (state.cancel) break;
-                    const r = await freeTranslate(freeProv, [...set], bl, prog, isCancelled);
-                    for (const [t, v] of r) back.set(`${bl}\0${t}`, cleanResult(v[0]));
+                    await gap(aiBack ? 'ai' : 'free');
+                    const part = new Map();
+                    try {
+                        if (aiBack) await aiTranslateList([...set], bl, prog, isCancelled, part);
+                        else await freeTranslate(freeProv, [...set], bl, prog, isCancelled, part);
+                    } finally {
+                        for (const [t, v] of part) back.set(`${bl}\0${t}`, cleanResult(Array.isArray(v) ? v[0] : v));
+                    }
                 }
-            } catch (e) { console.warn('[WIKT] back-translation failed', e); }
+            } catch (e) { reportError(e, '역번역 중단'); }
             for (const r of state.rows) for (const adds of Object.values(r.adds)) for (const a of adds) {
                 a.back = back.get(`${detectLang(a.src)}\0${a.t}`) ?? null;
             }
         }
         setBusy(false);
+        finishRun(state.cancel
+            ? `중지됨 — 지금까지 번역된 것: 엔트리 ${state.rows.length}개`
+            : `완료 — 새 키워드가 생긴 엔트리 ${state.rows.length}개`);
+    });
 
+    // --- chat finder: find real surface forms used in the current chat ---
+    chatBtn.addEventListener('click', async () => {
+        if (state.busy) return;
+        if (!state.data) await loadBook();
+        const excerpt = chatExcerpt();
+        if (!excerpt.trim()) { toastr.info('열려 있는 채팅에 메시지가 없어요. 채팅을 연 뒤 다시 눌러 주세요.'); return; }
+        const targets = targetEntries();
+        if (!targets.length) { toastr.info('찾을 엔트리가 없어요. (범위/선택을 확인해 주세요)'); return; }
+
+        const per = clampInt(s.chatEntries, 5, 200, SPEED_DEFAULTS.chatEntries);
+        const chunks = [];
+        for (let i = 0; i < targets.length; i += per) chunks.push(targets.slice(i, i + per));
+        const chars = chunks.reduce((a, ch) => a + AI_SYSTEM.length + buildChatPrompt(ch, excerpt).length, 0);
+        const ok = await c.Popup.show.confirm('채팅에서 실제 표기 찾기',
+            `${profileName()}로 최근 채팅 발췌(${excerpt.length.toLocaleString()}자) + 엔트리 ${targets.length}개의 제목·키워드를 보내요.\n요청 ${chunks.length}번 · 약 ${chars.toLocaleString()}자. 진행할까요?`);
+        if (!ok) return;
+
+        setBusy(true);
+        state.cancel = false;
+        state.mode = 'chat';
+        const hay = norm(chatMessages().join('\n'));
+        const found = new Map(); // uid → [strings]
+        const prog = phase('채팅 분석 중', targets.length);
+        const delay = clampInt(s.aiDelay, 0, 60000, SPEED_DEFAULTS.aiDelay);
+        try {
+            for (let i = 0; i < chunks.length; i++) {
+                if (state.cancel) break;
+                if (i > 0) await sleep(delay);
+                const ch = chunks[i];
+                const json = await callAIJson(buildChatPrompt(ch, excerpt), Math.min(8000, 300 + ch.length * 60));
+                ch.forEach((e, j) => {
+                    const v = json[`E${j + 1}`];
+                    const arr = (Array.isArray(v) ? v : (v ? [v] : [])).map((x) => cleanResult(x)).filter(Boolean);
+                    if (arr.length) found.set(String(e.uid), arr);
+                });
+                prog(ch.length);
+            }
+        } catch (e) {
+            reportError(e, '채팅 분석 중단');
+        }
+
+        state.rows = [];
+        let dropped = 0;
+        for (const e of targets) {
+            const cand = found.get(String(e.uid));
+            if (!cand) continue;
+            const seen = new Set((e.key || []).map(norm));
+            const adds = [];
+            for (const t of cand) {
+                // anti-hallucination: keep only strings that literally appear in the chat
+                if (t.length > 40 || seen.has(norm(t))) continue;
+                if (!hay.includes(norm(t))) { dropped++; continue; }
+                seen.add(norm(t));
+                adds.push({ t, src: '채팅', lang: 'chat', alt: null });
+            }
+            if (adds.length) state.rows.push({ uid: String(e.uid), title: entryTitle(e), adds: { key: adds } });
+        }
+        setBusy(false);
+        finishRun((state.cancel ? '중지됨 — ' : '완료 — ') + `채팅에서 새 표기를 찾은 엔트리 ${state.rows.length}개` +
+            (dropped ? ` (채팅에 실제로 없는 AI 답변 ${dropped}개는 버렸어요)` : ''));
+    });
+
+    function finishRun(prefix) {
+        const hay = norm(chatMessages().join('\n'));
+        for (const r of state.rows) for (const a of Object.values(r.adds).flat()) a.hits = hay ? countHits(hay, a.t) : null;
         renderPreview();
         const warn = state.rows.reduce((x, r) => x + Object.values(r.adds).flat().filter(isSuspicious).length, 0);
-        status.textContent = state.cancel
-            ? `중지됨 — 지금까지 번역된 것: 엔트리 ${state.rows.length}개`
-            : `완료 — 새 키워드가 생긴 엔트리 ${state.rows.length}개${warn ? `, 확인이 필요한 키워드 ⚠️ ${warn}개` : ''}. 확인 후 '적용'을 눌러주세요.`;
-    });
+        status.textContent = `${prefix}${warn ? `, 확인이 필요한 키워드 ⚠️ ${warn}개` : ''}.${state.rows.length ? " 확인 후 '적용'을 눌러주세요." : ''}`;
+    }
 
     const backOk = (a) => a.back != null && normLoose(a.back) === normLoose(a.src);
     const cmpOk = (a) => a.alt != null && a.alt.some((x) => norm(x) === norm(a.t));
@@ -603,13 +887,16 @@ async function openTranslator(presetBook) {
     }
 
     function renderChecks(adds, inp) {
-        const anyCheck = adds.some((a) => a.back != null || a.alt != null);
+        const anyCheck = adds.some((a) => a.back != null || a.alt != null || a.hits != null || a.lang === 'chat');
         if (!anyCheck) return null;
         const box = el('div', { class: 'wikt-checks' });
         for (const a of adds) {
             const bad = isSuspicious(a);
-            const parts = [el('b', { text: a.t }), el('small', { class: 'wikt-src', text: ` ← ${a.src} · ${langLabel(a.lang)}` })];
+            const parts = [el('b', { text: a.t }),
+                el('small', { class: 'wikt-src', text: a.lang === 'chat' ? ' ← 채팅 속 표기' : ` ← ${a.src} · ${langLabel(a.lang)}` })];
+            if (a.hits != null) parts.push(el('small', { class: a.hits ? 'wikt-ok' : 'wikt-src', text: ` · 채팅 ${a.hits}회` }));
             if (a.back != null) parts.push(el('small', { class: backOk(a) ? 'wikt-ok' : (bad ? 'wikt-bad' : 'wikt-src'), text: ` · 역번역: ${a.back || '(없음)'}` }));
+            let chip;
             if (a.alt != null) {
                 const label = provSel.value === 'ai' ? 'Google' : 'AI';
                 if (cmpOk(a)) parts.push(el('small', { class: 'wikt-ok', text: ` · ${label}도 같음` }));
@@ -618,12 +905,12 @@ async function openTranslator(presetBook) {
                     for (const alt of a.alt.slice(0, 2)) {
                         parts.push(el('span', {
                             class: 'menu_button wikt-swap', text: `→ ${alt} 사용`,
-                            onclick: () => { replaceInInput(inp, a.t, alt); a.t = alt; a.back = null; a.alt = null; chip.replaceWith(el('div', { class: 'wikt-chip', text: `✔ ${alt} (바꿈)` })); },
+                            onclick: () => { replaceInInput(inp, a.t, alt); a.t = alt; chip.replaceWith(el('div', { class: 'wikt-chip', text: `✔ ${alt} (바꿈)` })); },
                         }));
                     }
                 }
             }
-            const chip = el('div', { class: `wikt-chip ${bad ? 'is-bad' : 'is-ok'}` }, bad ? '⚠️ ' : '✔ ', parts);
+            chip = el('div', { class: `wikt-chip ${bad ? 'is-bad' : 'is-ok'}` }, bad ? '⚠️ ' : '✔ ', parts);
             box.append(chip);
         }
         return box;
@@ -690,8 +977,7 @@ async function openTranslator(presetBook) {
             renderPreview();
             status.textContent = '적용 완료! 잘못됐으면 "마지막 적용 되돌리기"를 눌러주세요.';
         } catch (e) {
-            console.error('[WIKT]', e);
-            toastr.error('저장에 실패했어요. 콘솔(F12)을 확인해 주세요.');
+            reportError(e, '저장 실패');
         }
     });
 
@@ -759,9 +1045,6 @@ function syncWIButton() {
 function addSettingsPanel() {
     const host = document.getElementById('extensions_settings2') || document.getElementById('extensions_settings');
     if (!host || document.getElementById('wikt_settings')) return;
-    const s = getSettings();
-    const wiCb = el('input', { type: 'checkbox', checked: s.wiButton });
-    wiCb.addEventListener('change', () => { s.wiButton = wiCb.checked; save(); syncWIButton(); });
     const panel = el('div', { id: 'wikt_settings', class: 'inline-drawer' },
         el('div', { class: 'inline-drawer-toggle inline-drawer-header' },
             el('b', { text: '월드인포 키워드 번역' }),
@@ -769,8 +1052,7 @@ function addSettingsPanel() {
         el('div', { class: 'inline-drawer-content' },
             el('div', { class: 'menu_button menu_button_icon', onclick: () => openTranslator(currentEditorBook()) },
                 el('i', { class: 'fa-solid fa-language' }), el('span', { text: '키워드 번역기 열기' })),
-            el('label', { class: 'checkbox_label' }, wiCb, el('span', { text: '월드인포 편집창에 번역 버튼 표시' })),
-            el('small', { text: '무료 번역은 키워드만 실리태번 서버를 거쳐 Google/Bing으로 보내요. AI 번역은 키워드와 엔트리 제목(본문은 켰을 때만)을 고른 연결로 보내요.' })));
+            el('small', { text: '세부 설정(AI 연결, 프롬프트, 속도·묶음)은 번역기 안의 "설정" 탭에 있어요.' })));
     host.append(panel);
 
     const menu = document.getElementById('extensionsMenu');

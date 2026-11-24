@@ -31,4 +31,12 @@
 .wikt-ok { color: #4caf7a; }
 .wikt-bad { color: #d9a43a; }
 .wikt-root .menu_button.wikt-swap { padding: 1px 8px; margin: 0 0 0 4px; font-size: 0.85em; }
+.wikt-tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--SmartThemeBorderColor); }
+.wikt-tabbtn { padding: 4px 14px; cursor: pointer; border: 1px solid transparent; border-bottom: none; border-radius: 8px 8px 0 0; opacity: 0.65; }
+.wikt-tabbtn.active { opacity: 1; border-color: var(--SmartThemeBorderColor); background: var(--SmartThemeBlurTintColor); font-weight: bold; }
+.wikt-tab { display: flex; flex-direction: column; gap: 8px; }
+.wikt-tab h4 { margin: 8px 0 0; }
+.wikt-setrow { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; }
+.wikt-setlabel { flex: 0 1 260px; }
+.wikt-root select.wikt-inline-select { flex: 0 1 220px; }
 .wikt-root .menu_button.disabled { opacity: 0.5; pointer-events: none; }

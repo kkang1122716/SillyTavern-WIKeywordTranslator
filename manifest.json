@@ -7,7 +7,7 @@
     "js": "index.js",
     "css": "style.css",
     "author": "kkang1122716",
-    "version": "1.0.1",
+    "version": "1.0.2",
     "homePage": "https://github.com/kkang1122716/SillyTavern-WIKeywordTranslator",
     "auto_update": false,
     "minimum_client_version": "1.13.0"
